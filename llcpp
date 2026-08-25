@@ -1,0 +1,1490 @@
+#!/usr/bin/env python3
+"""llcpp — an ollama-style CLI for llama.cpp.
+
+    llcpp pull  unsloth/Qwen3.8-27B-GGUF:Q6
+    llcpp run   qwen3.8-27b
+    llcpp list
+    llcpp rm    qwen3.8-27b
+
+Models live under $LLAMA_CACHE (default ~/.cache/llama.cpp). Stdlib only.
+
+What this does that `ollama` does not: it detects a repo's MTP head and wires up
+`--spec-type draft-mtp` automatically, detects `mmproj-*` for vision, and follows
+split GGUF shards. No wrapper process sits between you and llama-server.
+"""
+from __future__ import annotations
+
+import argparse
+import errno
+import json
+import math
+import os
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+HF_API = "https://huggingface.co/api"
+HF_RESOLVE = "https://huggingface.co/{repo}/resolve/main/{path}"
+DEFAULT_QUANT = "Q4_K_M"          # same default as ollama and `llama-server -hf`
+DEFAULT_CTX = 32768
+PORT_BASE = 8080
+FREE_SPACE_FLOOR = 10 * 1024**3   # refuse a pull that would leave less than this
+__version__ = "0.1.0"
+UA = {"User-Agent": "llcpp/" + __version__}
+
+# Quant tokens as they appear in GGUF filenames: Q4_K_M, UD-Q6_K_XL, IQ2_XXS, BF16...
+QUANT_RE = re.compile(r"(?:UD-)?(?:IQ\d+(?:_[A-Z0-9]+)*|Q\d+(?:_[A-Z0-9]+)*|BF16|F16|F32)", re.I)
+SHARD_RE = re.compile(r"^(?P<stem>.+)-(?P<idx>\d{5})-of-(?P<total>\d{5})\.gguf$", re.I)
+
+
+# ---------------------------------------------------------------- presentation
+
+def _tty() -> bool:
+    return sys.stderr.isatty()
+
+
+class C:
+    if os.environ.get("NO_COLOR") or not sys.stdout.isatty():
+        BOLD = DIM = RED = GRN = YLW = BLU = OFF = ""
+    else:
+        BOLD, DIM = "\033[1m", "\033[2m"
+        RED, GRN, YLW, BLU = "\033[31m", "\033[32m", "\033[33m", "\033[34m"
+        OFF = "\033[0m"
+
+
+def human(n: float) -> str:
+    # Decimal units, to match the sizes Hugging Face reports for the same files.
+    for unit in ("B", "KB", "MB", "GB", "TB"):
+        if abs(n) < 1000 or unit == "TB":
+            return f"{n:.0f} {unit}" if unit == "B" else f"{n:.1f} {unit}"
+        n /= 1000
+    return f"{n:.1f} TB"
+
+
+def human_ram(n: float) -> str:
+    return f"{n / 1024**3:.0f} GB"
+
+
+def ago(iso: str) -> str:
+    try:
+        then = datetime.fromisoformat(iso)
+    except ValueError:
+        return "unknown"
+    secs = (datetime.now(timezone.utc) - then).total_seconds()
+    for limit, div, name in ((60, 1, "second"), (3600, 60, "minute"),
+                             (86400, 3600, "hour"), (2592000, 86400, "day"),
+                             (31536000, 2592000, "month")):
+        if secs < limit:
+            v = int(secs / div) or 1
+            return f"{v} {name}{'s' if v != 1 else ''} ago"
+    v = int(secs / 31536000) or 1
+    return f"{v} year{'s' if v != 1 else ''} ago"
+
+
+def die(msg: str, code: int = 1) -> "NoReturn":  # noqa: F821
+    print(f"{C.RED}error:{C.OFF} {msg}", file=sys.stderr)
+    sys.exit(code)
+
+
+def info(msg: str) -> None:
+    print(msg, file=sys.stderr)
+
+
+# ------------------------------------------------------------------- registry
+
+def cache_root() -> Path:
+    raw = os.environ.get("LLAMA_CACHE") or str(Path.home() / ".cache" / "llama.cpp")
+    return Path(raw).expanduser()
+
+
+def models_dir() -> Path:
+    return cache_root() / "models"
+
+
+def reg_path() -> Path:
+    return cache_root() / "registry.json"
+
+
+def load_reg() -> dict:
+    try:
+        with open(reg_path()) as fh:
+            reg = json.load(fh)
+    except (FileNotFoundError, json.JSONDecodeError):
+        reg = {}
+    reg.setdefault("models", {})
+    reg.setdefault("servers", {})
+    return reg
+
+
+def save_reg(reg: dict) -> None:
+    reg_path().parent.mkdir(parents=True, exist_ok=True)
+    tmp = reg_path().with_suffix(".json.tmp")
+    with open(tmp, "w") as fh:
+        json.dump(reg, fh, indent=2, sort_keys=True)
+    tmp.replace(reg_path())
+
+
+def hf_token() -> "str | None":
+    tok = os.environ.get("HF_TOKEN")
+    if tok:
+        return tok.strip()
+    home = os.environ.get("HF_HOME") or str(Path.home() / ".cache" / "huggingface")
+    try:
+        return (Path(home) / "token").read_text().strip() or None
+    except OSError:
+        return None
+
+
+# ----------------------------------------------------------------- HF client
+
+def hf_get(url: str) -> object:
+    headers = dict(UA)
+    tok = hf_token()
+    if tok:
+        headers["Authorization"] = f"Bearer {tok}"
+    try:
+        with urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=30) as r:
+            return json.load(r)
+    except urllib.error.HTTPError as e:
+        if e.code == 401:
+            die("Hugging Face returned 401. The repo is gated — accept its terms and "
+                "set HF_TOKEN (or log in so a token exists under $HF_HOME/token).")
+        if e.code == 404:
+            die(f"not found on Hugging Face: {url.split('/models/')[-1].split('/tree')[0]}")
+        die(f"Hugging Face API error {e.code}: {e.reason}")
+    except urllib.error.URLError as e:
+        die(f"cannot reach Hugging Face: {e.reason}")
+
+
+def repo_files(repo: str) -> "list[dict]":
+    """Every file in the repo, including subdirectories (MTP/, BF16/ shards)."""
+    data = hf_get(f"{HF_API}/models/{repo}/tree/main?recursive=true")
+    out = []
+    for e in data:  # type: ignore[union-attr]
+        if e.get("type") != "file":
+            continue
+        size = e.get("lfs", {}).get("size") or e.get("size") or 0
+        out.append({"path": e["path"], "size": size})
+    return out
+
+
+def hf_search(query: str, limit: int = 5) -> "list[dict]":
+    q = urllib.parse.quote(query)
+    url = f"{HF_API}/models?search={q}&filter=gguf&sort=downloads&direction=-1&limit={limit}"
+    return hf_get(url)  # type: ignore[return-value]
+
+
+def hf_quicksearch(query: str, limit: int = 10) -> "list[dict]":
+    """Second retrieval channel — more forgiving than ?search=, but no metadata."""
+    q = urllib.parse.quote(query)
+    try:
+        with urllib.request.urlopen(urllib.request.Request(
+                f"https://huggingface.co/api/quicksearch?q={q}&type=model",
+                headers=UA), timeout=20) as r:
+            out = json.load(r).get("models", [])
+    except Exception:
+        return []
+    return [{"id": m["id"], "downloads": 0} for m in out[:limit]]
+
+
+def retrieve(queries: "list[str]", per_query: int) -> "list[dict]":
+    """Union several lexical probes across both HF search endpoints."""
+    import concurrent.futures as cf
+    found: "dict[str, dict]" = {}
+    jobs = []
+    with cf.ThreadPoolExecutor(max_workers=8) as pool:
+        for q in queries:
+            jobs.append(pool.submit(hf_search, q, per_query))
+            jobs.append(pool.submit(hf_quicksearch, q, per_query))
+        for fut in cf.as_completed(jobs):
+            try:
+                res = fut.result()
+            except Exception:
+                continue
+            for m in res or []:
+                cur = found.get(m["id"])
+                # ?search= carries download counts; quicksearch does not. Keep the
+                # richer record when the same repo arrives from both.
+                if not cur or (m.get("downloads", 0) > cur.get("downloads", 0)):
+                    found[m["id"]] = m
+    return list(found.values())
+
+
+# ------------------------------------------------------- name/quant resolution
+
+def quant_token(path: str) -> "str | None":
+    """Pull the quant label out of a GGUF filename, e.g. UD-Q6_K_XL."""
+    name = Path(path).name
+    m = SHARD_RE.match(name)
+    if m:
+        name = m.group("stem") + ".gguf"
+    hits = QUANT_RE.findall(name[: -len(".gguf")] if name.endswith(".gguf") else name)
+    if not hits:
+        return None
+    # findall with a non-capturing pattern returns whole matches; take the last.
+    return hits[-1].upper()
+
+
+def _bare(q: str) -> str:
+    q = q.upper()
+    return q[3:] if q.startswith("UD-") else q
+
+
+def score_quant(cand: str, want: str) -> int:
+    """Higher is better; -1 means incompatible."""
+    c, w = _bare(cand), _bare(want)
+    if c == w:
+        s = 100
+    elif c.startswith(w):
+        s = 80 - (len(c) - len(w))
+    elif w in c:
+        s = 60 - (len(c) - len(w))
+    else:
+        return -1
+    if cand.upper().startswith("UD-"):
+        s += 5  # unsloth dynamic quants beat plain ones at the same size
+    return s
+
+
+def is_aux(path: str) -> bool:
+    n = Path(path).name.lower()
+    return (n.startswith("mmproj") or n.startswith("imatrix")
+            or "/mtp" in path.lower() or n.startswith("mtp-"))
+
+
+def pick_weights(files: "list[dict]", want: str) -> "list[dict]":
+    """Choose the main weight file(s) for a quant, following split shards."""
+    cands = {}
+    for f in files:
+        p = f["path"]
+        if not p.lower().endswith(".gguf") or is_aux(p):
+            continue
+        q = quant_token(p)
+        if not q:
+            continue
+        sc = score_quant(q, want)
+        if sc < 0:
+            continue
+        cands.setdefault(q, {"score": sc, "files": []})
+        cands[q]["files"].append(f)
+
+    if not cands:
+        avail = sorted({quant_token(f["path"]) or "?" for f in files
+                        if f["path"].lower().endswith(".gguf") and not is_aux(f["path"])})
+        die(f"no quant matching {want!r}. Available: {', '.join(avail)}")
+
+    best = max(cands.items(), key=lambda kv: (kv[1]["score"], -len(kv[0])))
+    picked = sorted(best[1]["files"], key=lambda f: f["path"])
+    return picked
+
+
+def pick_mtp(files: "list[dict]") -> "dict | None":
+    for f in files:
+        n = Path(f["path"]).name.lower()
+        if n.startswith("mtp-") or "/mtp" in f["path"].lower():
+            if n.endswith(".gguf"):
+                return f
+    return None
+
+
+def pick_mmproj(files: "list[dict]") -> "dict | None":
+    cands = [f for f in files if Path(f["path"]).name.lower().startswith("mmproj")]
+    if not cands:
+        return None
+    # F16 is the safer choice on the Metal backend than BF16. Compare whole quant
+    # tokens, not substrings — "f16" is a substring of "bf16".
+    order = {"F16": 0, "BF16": 1, "F32": 2}
+    return sorted(cands, key=lambda f: (order.get(quant_token(f["path"]) or "", 9),
+                                        f["path"]))[0]
+
+
+def short_name(repo: str, quant: str) -> str:
+    base = repo.split("/")[-1]
+    base = re.sub(r"[-_]?GGUF$", "", base, flags=re.I)
+    return f"{base.lower()}:{quant.lower()}"
+
+
+def resolve_ref(ref: str, reg: dict, assume_yes: bool = False) -> "tuple[str, str]":
+    """Turn user input into (repo, quant)."""
+    if ":" in ref and "/" in ref.split(":")[0]:
+        repo, quant = ref.rsplit(":", 1)
+        return repo, quant
+    if "/" in ref:
+        return ref, DEFAULT_QUANT
+
+    # Bare name: an already-pulled model wins, then fall back to HF search.
+    matches = [n for n in reg["models"] if n == ref or n.split(":")[0] == ref.split(":")[0]]
+    if ":" in ref:
+        matches = [n for n in matches if n == ref]
+    if len(matches) == 1:
+        m = reg["models"][matches[0]]
+        return m["repo"], m["quant"]
+    if len(matches) > 1:
+        die(f"{ref!r} is ambiguous: {', '.join(sorted(matches))}")
+
+    name, quant = (ref.split(":", 1) + [DEFAULT_QUANT])[:2]
+    info(f"{C.DIM}searching Hugging Face for {name!r}…{C.OFF}")
+    hits = hf_search(name)
+    if not hits:
+        die(f"no GGUF repo found for {name!r}. Pass an explicit org/repo:quant.")
+    repo = hits[0]["id"]
+    if not assume_yes:
+        others = ", ".join(h["id"] for h in hits[1:4])
+        info(f"  → {C.BOLD}{repo}{C.OFF}" + (f"{C.DIM}  (also: {others}){C.OFF}" if others else ""))
+    return repo, quant
+
+
+# ------------------------------------------------------------------ downloads
+
+def download(url: str, dest: Path, total: int, label: str) -> None:
+    """Resumable single-stream GET with a progress line."""
+    dest.parent.mkdir(parents=True, exist_ok=True)
+    have = dest.stat().st_size if dest.exists() else 0
+    if total and have == total:
+        info(f"  {C.GRN}✓{C.OFF} {label} {C.DIM}(already complete){C.OFF}")
+        return
+    if total and have > total:
+        have = 0
+        dest.unlink(missing_ok=True)
+
+    headers = dict(UA)
+    tok = hf_token()
+    if tok:
+        headers["Authorization"] = f"Bearer {tok}"
+    if have:
+        headers["Range"] = f"bytes={have}-"
+
+    req = urllib.request.Request(url, headers=headers)
+    try:
+        resp = urllib.request.urlopen(req, timeout=60)
+    except urllib.error.HTTPError as e:
+        if e.code == 416 and total and have >= total:
+            return
+        die(f"download failed ({e.code} {e.reason}): {label}")
+    except urllib.error.URLError as e:
+        die(f"download failed ({e.reason}): {label}")
+
+    mode = "ab" if (have and resp.status == 206) else "wb"
+    if mode == "wb":
+        have = 0
+
+    start, last, done = time.time(), 0.0, have
+    with resp, open(dest, mode) as fh:
+        while True:
+            chunk = resp.read(1 << 20)
+            if not chunk:
+                break
+            fh.write(chunk)
+            done += len(chunk)
+            now = time.time()
+            if _tty() and (now - last > 0.2):
+                last = now
+                rate = (done - have) / max(now - start, 1e-6)
+                pct = f"{done / total * 100:5.1f}%" if total else "  ?  "
+                eta = ""
+                if total and rate > 0:
+                    secs = int((total - done) / rate)
+                    eta = f"  eta {secs // 60}m{secs % 60:02d}s"
+                sys.stderr.write(
+                    f"\r  {label[:38]:38s} {pct}  {human(done):>9s}"
+                    f"  {human(rate)}/s{eta}   ")
+                sys.stderr.flush()
+    if _tty():
+        sys.stderr.write("\r" + " " * 100 + "\r")
+    elapsed = time.time() - start
+    info(f"  {C.GRN}✓{C.OFF} {label} {C.DIM}({human(done)} in {elapsed:.0f}s){C.OFF}")
+
+
+# ------------------------------------------------------------ server lifecycle
+
+def alive(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except OSError as e:
+        return e.errno == errno.EPERM
+    return True
+
+
+def health(port: int, timeout: float = 2.0) -> bool:
+    try:
+        with urllib.request.urlopen(f"http://127.0.0.1:{port}/health", timeout=timeout) as r:
+            return json.load(r).get("status") == "ok"
+    except Exception:
+        return False
+
+
+def free_port(reg: dict) -> int:
+    import socket
+    used = {s["port"] for s in reg["servers"].values()}
+    for p in range(PORT_BASE, PORT_BASE + 200):
+        if p in used:
+            continue
+        with socket.socket() as s:
+            try:
+                s.bind(("127.0.0.1", p))
+            except OSError:
+                continue
+        return p
+    die("no free port in range 8080-8280")
+
+
+def reap(reg: dict) -> dict:
+    """Drop registry entries whose process is gone."""
+    for name in list(reg["servers"]):
+        if not alive(reg["servers"][name]["pid"]):
+            del reg["servers"][name]
+    return reg
+
+
+def build_cmd(entry: dict, port: int, ctx: int, name: str, vision: bool = True) -> "list[str]":
+    root = models_dir() / entry["dir"]
+    cmd = ["llama-server", "-m", str(root / entry["main"])]
+    if entry.get("mtp"):
+        cmd += ["-md", str(root / entry["mtp"]),
+                "--spec-type", "draft-mtp",
+                "--spec-draft-n-max", "3", "--spec-draft-n-min", "1"]
+    # llama-server disables prompt-cache reuse whenever an mmproj is loaded, which
+    # is a bad trade for coding work that resends the same file context.
+    if entry.get("mmproj") and vision:
+        cmd += ["--mmproj", str(root / entry["mmproj"])]
+    cmd += ["-a", name.split(":")[0],
+            "-c", str(ctx), "-ngl", "99", "-fa", "on",
+            "--cache-reuse", "256", "--jinja",
+            "--reasoning-format", "deepseek",
+            "--no-context-shift",
+            "--host", "127.0.0.1", "--port", str(port)]
+    return cmd
+
+
+def ensure_server(name: str, reg: dict, ctx: int, port: "int | None" = None,
+                  vision: bool = True) -> "tuple[int, dict]":
+    reap(reg)
+    entry = reg["models"].get(name)
+    if not entry:
+        die(f"model {name!r} is not pulled. Try: llcpp pull {name}")
+
+    running = reg["servers"].get(name)
+    if running and health(running["port"]):
+        if port and running["port"] != port:
+            die(f"{name} is already serving on port {running['port']}; "
+                f"stop it first (llcpp stop {name}) to move it to {port}")
+        return running["port"], reg
+
+    port = port or free_port(reg)
+    if not shutil.which("llama-server"):
+        die("llama-server not on PATH. Install llama.cpp (brew install llama.cpp).")
+
+    logs = cache_root() / "logs"
+    logs.mkdir(parents=True, exist_ok=True)
+    logf = logs / f"{name.replace('/', '_').replace(':', '_')}.log"
+    cmd = build_cmd(entry, port, ctx, name, vision)
+
+    extras = []
+    if entry.get("mtp"):
+        extras.append("MTP spec-decode")
+    if entry.get("mmproj") and vision:
+        extras.append("vision")
+    elif entry.get("mmproj"):
+        extras.append("no vision, cache-reuse on")
+    suffix = f" {C.DIM}({', '.join(extras)}){C.OFF}" if extras else ""
+    info(f"{C.DIM}starting {name} on :{port}{C.OFF}{suffix}")
+
+    with open(logf, "ab") as fh:
+        fh.write(f"\n=== {datetime.now(timezone.utc).isoformat()} :{port} ===\n".encode())
+        fh.write((" ".join(cmd) + "\n").encode())
+        proc = subprocess.Popen(cmd, stdout=fh, stderr=subprocess.STDOUT,
+                                stdin=subprocess.DEVNULL, start_new_session=True)
+
+    for _ in range(600):  # up to ~5 min for a cold, large model
+        if proc.poll() is not None:
+            tail = logf.read_text(errors="replace").splitlines()[-15:]
+            die("llama-server exited during startup:\n  " + "\n  ".join(tail))
+        if health(port, timeout=1.0):
+            break
+        time.sleep(0.5)
+    else:
+        proc.terminate()
+        die(f"server did not become healthy; see {logf}")
+
+    reg["servers"][name] = {"port": port, "pid": proc.pid,
+                            "started": datetime.now(timezone.utc).isoformat(),
+                            "ctx": ctx, "log": str(logf)}
+    save_reg(reg)
+    return port, reg
+
+
+# ---------------------------------------------------------------- chat client
+
+def stream_chat(port: int, messages: list, think: bool, max_tokens: int = 4096) -> dict:
+    """Stream one completion; print as it arrives. Returns the assistant message."""
+    body = {"model": "llcpp", "messages": messages, "stream": True,
+            "max_tokens": max_tokens, "temperature": 0.6, "top_p": 0.95}
+    if not think:
+        body["chat_template_kwargs"] = {"enable_thinking": False}
+
+    req = urllib.request.Request(
+        f"http://127.0.0.1:{port}/v1/chat/completions",
+        json.dumps(body).encode(), {"Content-Type": "application/json"})
+
+    content, reasoning, in_think = [], [], False
+    try:
+        with urllib.request.urlopen(req, timeout=900) as resp:
+            for raw in resp:
+                line = raw.decode("utf-8", "replace").strip()
+                if not line.startswith("data:"):
+                    continue
+                payload = line[5:].strip()
+                if payload == "[DONE]":
+                    break
+                try:
+                    delta = json.loads(payload)["choices"][0].get("delta", {})
+                except (json.JSONDecodeError, KeyError, IndexError):
+                    continue
+                if delta.get("reasoning_content"):
+                    if not in_think:
+                        sys.stdout.write(f"{C.DIM}")
+                        in_think = True
+                    sys.stdout.write(delta["reasoning_content"])
+                    reasoning.append(delta["reasoning_content"])
+                if delta.get("content"):
+                    if in_think:
+                        sys.stdout.write(f"{C.OFF}\n")
+                        in_think = False
+                    sys.stdout.write(delta["content"])
+                    content.append(delta["content"])
+                sys.stdout.flush()
+    except KeyboardInterrupt:
+        sys.stdout.write(f"{C.OFF}\n{C.DIM}[interrupted]{C.OFF}\n")
+    except urllib.error.URLError as e:
+        die(f"request failed: {e.reason}")
+    if in_think:
+        sys.stdout.write(C.OFF)
+    sys.stdout.write("\n")
+    sys.stdout.flush()
+    return {"role": "assistant", "content": "".join(content),
+            "reasoning": "".join(reasoning)}
+
+
+def repl(name: str, port: int) -> None:
+    think = True
+    messages: list = []
+    print(f"{C.DIM}{name} on :{port} — /bye to exit, /? for commands{C.OFF}")
+    while True:
+        try:
+            line = input(f"{C.BOLD}>>>{C.OFF} ").strip()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return
+        if not line:
+            continue
+        if line in ("/bye", "/exit", "/quit"):
+            return
+        if line == "/?":
+            print("  /bye            exit\n"
+                  "  /clear          forget the conversation\n"
+                  "  /think on|off   toggle reasoning\n"
+                  "  /web            open the llama.cpp web UI")
+            continue
+        if line == "/clear":
+            messages = []
+            print(f"{C.DIM}context cleared{C.OFF}")
+            continue
+        if line.startswith("/think"):
+            arg = line.split()[-1]
+            think = arg != "off"
+            print(f"{C.DIM}thinking {'on' if think else 'off'}{C.OFF}")
+            continue
+        if line == "/web":
+            subprocess.run(["open", f"http://127.0.0.1:{port}"], check=False)
+            continue
+        messages.append({"role": "user", "content": line})
+        reply = stream_chat(port, messages, think)
+        messages.append({"role": "assistant", "content": reply["content"]})
+
+
+# ----------------------------------------------------------- hardware profile
+
+# Apple Silicon unified-memory bandwidth, GB/s. Only the entry for this machine
+# (M5 Max) is vendor-confirmed; the rest are close enough to rank with. Override
+# with LLCPP_BANDWIDTH if you know better.
+BANDWIDTH_GBPS = {
+    "M1": 68, "M1 PRO": 200, "M1 MAX": 400, "M1 ULTRA": 800,
+    "M2": 100, "M2 PRO": 200, "M2 MAX": 400, "M2 ULTRA": 800,
+    "M3": 100, "M3 PRO": 150, "M3 MAX": 400, "M3 ULTRA": 800,
+    "M4": 120, "M4 PRO": 273, "M4 MAX": 546,
+    "M5": 153, "M5 PRO": 307, "M5 MAX": 614, "M5 ULTRA": 1228,
+}
+DENSE_EFF = 0.70   # fraction of peak bandwidth a dense decode actually reaches
+MOE_EFF = 0.55     # MoE pays routing overhead on top
+
+
+def _sysctl(key: str) -> "str | None":
+    try:
+        out = subprocess.run(["sysctl", "-n", key], capture_output=True, text=True, timeout=5)
+        return out.stdout.strip() or None
+    except (OSError, subprocess.SubprocessError):
+        return None
+
+
+def hw_profile() -> dict:
+    ram = 0
+    chip = ""
+    if sys.platform == "darwin":
+        ram = int(_sysctl("hw.memsize") or 0)
+        chip = _sysctl("machdep.cpu.brand_string") or ""
+    else:
+        try:
+            for line in open("/proc/meminfo"):
+                if line.startswith("MemTotal:"):
+                    ram = int(line.split()[1]) * 1024
+                    break
+        except OSError:
+            pass
+
+    key = re.sub(r"^Apple\s+", "", chip).upper().strip()
+    bw = float(os.environ.get("LLCPP_BANDWIDTH") or BANDWIDTH_GBPS.get(key, 0))
+
+    # macOS caps GPU-addressable unified memory at ~75% unless iogpu is raised.
+    wired_mb = int(_sysctl("iogpu.wired_limit_mb") or 0)
+    vram = wired_mb * 1024**2 if wired_mb else int(ram * 0.75)
+    return {"ram": ram, "chip": chip or "unknown", "bandwidth": bw, "vram": vram}
+
+
+def budget_bytes(hw: dict, ctx_reserve: float = 0.15, floor: int = 3 * 1000**3) -> int:
+    """Room for weights, leaving headroom for KV cache and compute buffers."""
+    return max(int(hw["vram"] * (1 - ctx_reserve)) - floor, 0)
+
+
+def active_ratio(name: str) -> float:
+    """MoE models named like 30B-A3B only stream their active params per token."""
+    m = re.search(r"(\d+(?:\.\d+)?)B[-_]?A(\d+(?:\.\d+)?)B", name, re.I)
+    if m:
+        total, active = float(m.group(1)), float(m.group(2))
+        if total > 0:
+            return min(max(active / total, 0.02), 1.0)
+    return 1.0
+
+
+def est_tps(size: int, ratio: float, bw: float) -> "float | None":
+    """Decode is memory-bandwidth bound: tok/s ~= bandwidth / bytes-read-per-token."""
+    if not bw or not size:
+        return None
+    eff = DENSE_EFF if ratio >= 0.999 else MOE_EFF
+    gb = (size / 1e9) * ratio
+    return bw / max(gb, 0.05) * eff
+
+
+# --------------------------------------------------------------- query parsing
+
+SIZE_RE = re.compile(
+    r"(?:under|below|less\s+than|max(?:imum)?|at\s+most|within|fits?\s*(?:in|into|on)?|<=?|~)?"
+    r"\s*(\d+(?:\.\d+)?)\s*(gb|gib|g|tb)\b", re.I)
+SYNONYMS = {"coding": "coder", "code": "coder", "programming": "coder",
+            "vision": "vl", "multimodal": "vl", "image": "vl",
+            "embedding": "embed", "embeddings": "embed", "rerank": "reranker"}
+STOPWORDS = set("""a an the for that which with of to in on my me i we want need find show
+me best good great fastest fast small smallest big biggest large largest quality
+model models llm llms gguf quant quants run runs running local locally hardware
+machine mac macbook ram memory unified and or is are can could would something
+please give recommend suggest what whats about like most least than then use using
+under below over above within fits fit at must be should will editor ide
+autocomplete completion assistant chat chatbot task tasks work working help
+quick snappy responsive latency thing stuff one some any""".split())
+
+
+# Hugging Face search is keyword-based, not semantic. When a request describes a
+# job but names no model, steer it at a family known to do that job well. These
+# are starting points, not verdicts — the ranking still decides.
+INTENT_HINTS = [
+    (r"\b(autocomplete|fim|fill[- ]in[- ]the[- ]middle|inline)\b", "qwen2.5-coder"),
+    (r"\b(coder|refactor|debug|repo)\b", "qwen3-coder"),
+    (r"\b(vl|screenshot|diagram|ocr)\b", "qwen3-vl"),
+    (r"\b(embed|rag|retrieval|semantic)\b", "embeddinggemma"),
+    (r"\b(reason|reasoning|think|thinking|math|proof)\b", "qwen3"),
+    (r"\b(translate|translation|multilingual)\b", "gemma"),
+    (r"\b(agent|agentic|tool|tools)\b", "qwen3-coder"),
+]
+
+
+def parse_query(q: str) -> "tuple[str, dict]":
+    """Heuristically split free text into search terms plus hard constraints."""
+    ql = " " + q.lower().strip() + " "
+    cons: dict = {}
+
+    m = SIZE_RE.search(ql)
+    if m:
+        val = float(m.group(1))
+        unit = m.group(2).lower()
+        cons["max_bytes"] = int(val * (1000**4 if unit == "tb" else 1000**3))
+        ql = ql[:m.start()] + " " + ql[m.end():]
+
+    if re.search(r"\b(vision|multimodal|image|images|screenshot|vlm|see)\b", ql):
+        cons["vision"] = True
+    if re.search(r"\b(mtp|speculative|draft)\b", ql):
+        cons["mtp"] = True
+    if re.search(r"\b(fast|fastest|quick|snappy|low[- ]?latency|responsive)\b", ql):
+        cons["prefer"] = "speed"
+    elif re.search(r"\b(best|smartest|strongest|highest[- ]?quality|most capable)\b", ql):
+        cons["prefer"] = "quality"
+
+    words = re.sub(r"[^\w.+-]+", " ", ql).split()
+    terms = [SYNONYMS.get(w, w) for w in words if w not in STOPWORDS]
+    # de-dupe, keep order
+    seen, out = set(), []
+    for t in terms:
+        if t not in seen:
+            seen.add(t)
+            out.append(t)
+    if not out:
+        for pat, family in INTENT_HINTS:
+            if re.search(pat, ql):
+                out = [family]
+                cons["inferred_family"] = family
+                break
+    return " ".join(out), cons
+
+
+def _ask_local(port: int, prompt: str, max_tokens: int) -> "str | None":
+    body = {"model": "llcpp", "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": max_tokens, "temperature": 0.0,
+            "chat_template_kwargs": {"enable_thinking": False}}
+    try:
+        req = urllib.request.Request(f"http://127.0.0.1:{port}/v1/chat/completions",
+                                     json.dumps(body).encode(),
+                                     {"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=180) as r:
+            return json.load(r)["choices"][0]["message"]["content"]
+    except Exception:
+        return None
+
+
+def _json_blob(txt: "str | None") -> "dict | None":
+    if not txt:
+        return None
+    m = re.search(r"\{.*\}", txt, re.S)
+    if not m:
+        return None
+    try:
+        return json.loads(m.group(0))
+    except json.JSONDecodeError:
+        return None
+
+
+def llm_expand(q: str, port: int) -> "tuple[list, dict] | None":
+    """Stage 1: turn a request into several lexical queries plus constraints.
+
+    Hugging Face search matches on repo names only, so a whole sentence returns
+    nothing. Several short guesses beat one, and wrong ones cost only a request.
+    """
+    prompt = (
+        "You are helping search Hugging Face for GGUF model repos. Repo names look "
+        "like 'unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF'. Search matches NAMES ONLY, "
+        "so queries must be short model-name fragments, never sentences.\n"
+        'Return JSON: {"queries": ["q1","q2","q3"], "max_gb": <number or null>, '
+        '"vision": <true|false>, "prefer": "speed"|"quality"|null}\n'
+        "Rules: 2-4 queries, each 1-3 words naming a model family or capability "
+        "(e.g. 'qwen3 coder', 'codestral', 'devstral'). Set max_gb ONLY for an "
+        "explicit size limit — 'small' means prefer=speed, not a byte budget.\n"
+        "Request: " + q + "\nJSON only.")
+    d = _json_blob(_ask_local(port, prompt, 400))
+    if not d:
+        return None
+    queries = [str(x).strip() for x in (d.get("queries") or []) if str(x).strip()]
+    queries = [x for x in queries if len(x) < 40][:4]
+    cons: dict = {}
+    if d.get("max_gb"):
+        try:
+            cons["max_bytes"] = int(float(d["max_gb"]) * 1000**3)
+        except (TypeError, ValueError):
+            pass
+    if d.get("vision"):
+        cons["vision"] = True
+    if d.get("prefer") in ("speed", "quality"):
+        cons["prefer"] = d["prefer"]
+    return queries, cons
+
+
+def llm_rerank(q: str, rows: "list[dict]", port: int) -> "dict | None":
+    """Stage 2: judge a shortlist against the original request.
+
+    This is where a local model actually earns its place — picking among concrete
+    candidates it can see is a far easier task than inventing search keywords.
+    """
+    lines = []
+    for i, r in enumerate(rows):
+        tps = f"{r['tps']:.0f} tok/s" if r["tps"] else "unknown speed"
+        flags = ",".join(filter(None, ["mtp" if r["mtp"] else "",
+                                       "vision" if r["vision"] else "",
+                                       "moe" if r["moe"] else ""])) or "dense"
+        lines.append(f"{i}. {r['repo']} | {r['quant']} | {human(r['size'])} | "
+                     f"{tps} | {flags} | {r['downloads']} downloads")
+    prompt = ("Pick the best local models for this request:\n" + q + "\n\nCandidates:\n"
+              + "\n".join(lines)
+              + "\n\nRank them for the request. Judge suitability of the model family "
+                "for the stated job, then speed and popularity. Ignore repos that are "
+                "fine-tunes for an unrelated language or domain.\n"
+                'Return JSON: {"order": [<indices best first, at most 8>], '
+                '"reasons": {"<index>": "<max 9 words>"}}\nJSON only.')
+    d = _json_blob(_ask_local(port, prompt, 900))
+    if not d or not isinstance(d.get("order"), list):
+        return None
+    order, seen = [], set()
+    for x in d["order"]:
+        try:
+            i = int(x)
+        except (TypeError, ValueError):
+            continue
+        if 0 <= i < len(rows) and i not in seen:
+            seen.add(i)
+            order.append(i)
+    if not order:
+        return None
+    reasons = {}
+    for k, v in (d.get("reasons") or {}).items():
+        try:
+            reasons[int(k)] = str(v)[:60]
+        except (TypeError, ValueError):
+            continue
+    return {"order": order, "reasons": reasons}
+
+
+# -------------------------------------------------------------- portal search
+
+def search_docker(terms: str, limit: int = 5) -> "list[dict]":
+    """Docker Hub's curated ai/ namespace — what `llama-server -dr` pulls from."""
+    cache = cache_root() / "docker_catalog.json"
+    cat = None
+    if cache.exists() and time.time() - cache.stat().st_mtime < 86400:
+        try:
+            cat = json.loads(cache.read_text())
+        except json.JSONDecodeError:
+            cat = None
+    if cat is None:
+        try:
+            with urllib.request.urlopen(urllib.request.Request(
+                    "https://hub.docker.com/v2/repositories/ai/?page_size=100",
+                    headers=UA), timeout=20) as r:
+                cat = json.load(r).get("results", [])
+            cache.parent.mkdir(parents=True, exist_ok=True)
+            cache.write_text(json.dumps(cat))
+        except Exception:
+            return []
+
+    words = [w for w in terms.split() if len(w) > 2]
+    hits = []
+    for repo in cat:
+        blob = (repo["name"] + " " + (repo.get("description") or "")).lower()
+        if not words or any(w in blob for w in words):
+            hits.append(repo)
+    hits.sort(key=lambda r: r.get("pull_count", 0), reverse=True)
+    return hits[:limit]
+
+
+def docker_tags(name: str) -> "list[dict]":
+    try:
+        with urllib.request.urlopen(urllib.request.Request(
+                f"https://hub.docker.com/v2/repositories/ai/{name}/tags?page_size=50",
+                headers=UA), timeout=20) as r:
+            return json.load(r).get("results", [])
+    except Exception:
+        return []
+
+
+def enrich_repo(repo: str) -> "dict | None":
+    """Fetch a repo's file tree and summarise its usable quants."""
+    try:
+        files = repo_files(repo)
+    except SystemExit:
+        return None
+    except Exception:
+        return None
+    opts = {}
+    for f in files:
+        p = f["path"]
+        if not p.lower().endswith(".gguf") or is_aux(p):
+            continue
+        q = quant_token(p)
+        if not q:
+            continue
+        opts[q] = opts.get(q, 0) + f["size"]
+    if not opts:
+        return None
+    return {"quants": opts,
+            "mtp": pick_mtp(files) is not None,
+            "vision": pick_mmproj(files) is not None}
+
+
+FULL_PRECISION = re.compile(r"^(UD-)?(BF16|F16|F32)$", re.I)
+
+
+def quant_bits(q: str) -> int:
+    """Bits per weight, so Q2_K sorts below Q4_K_M rather than beside it."""
+    if FULL_PRECISION.match(q):
+        return 16
+    m = re.search(r"(?:IQ|Q)(\d+)", q, re.I)
+    return int(m.group(1)) if m else 0
+
+
+def choose_quant(quants: dict, budget: int, prefer: str) -> "tuple[str, int] | None":
+    fits = [(q, s) for q, s in quants.items() if s <= budget]
+    if not fits:
+        return None
+    if prefer == "speed":
+        # Cheapest option that is still 4-bit or better. Q2/Q3 are badly degraded
+        # and are never the right answer to "fast".
+        decent = [(q, s) for q, s in fits if quant_bits(q) >= 4]
+        return min(decent or fits, key=lambda kv: kv[1])
+    # "Best that fits" stops at Q8. F16/BF16 doubles the size and halves the speed
+    # for no measurable quality gain over an 8-bit quant.
+    capped = [(q, s) for q, s in fits if not FULL_PRECISION.match(q)]
+    return max(capped or fits, key=lambda kv: kv[1])
+
+
+# ------------------------------------------------------------------- commands
+
+def cmd_pull(args: argparse.Namespace) -> None:
+    reg = load_reg()
+    repo, want = resolve_ref(args.model, reg, args.yes)
+    info(f"{C.DIM}resolving {repo}:{want}{C.OFF}")
+    files = repo_files(repo)
+
+    weights = pick_weights(files, want)
+    quant = quant_token(weights[0]["path"]) or want
+    mtp = None if args.no_mtp else pick_mtp(files)
+    mmproj = None if args.no_vision else pick_mmproj(files)
+
+    plan = list(weights) + [f for f in (mtp, mmproj) if f]
+    total = sum(f["size"] for f in plan)
+
+    dest_dir = models_dir() / repo
+    have = sum((dest_dir / f["path"]).stat().st_size
+               for f in plan if (dest_dir / f["path"]).exists())
+    need = max(total - have, 0)
+
+    free = shutil.disk_usage(cache_root().parent if cache_root().exists()
+                             else Path.home()).free
+    name = short_name(repo, quant)
+    info(f"{C.BOLD}{name}{C.OFF}  {human(total)}"
+         + (f"  {C.DIM}({human(need)} to fetch){C.OFF}" if have else ""))
+    for f in plan:
+        tag = ""
+        if mtp and f is mtp:
+            tag = f"  {C.GRN}[MTP → ~2x decode]{C.OFF}"
+        elif mmproj and f is mmproj:
+            tag = f"  {C.BLU}[vision]{C.OFF}"
+        info(f"  {C.DIM}·{C.OFF} {f['path']}  {C.DIM}{human(f['size'])}{C.OFF}{tag}")
+
+    if free - need < FREE_SPACE_FLOOR:
+        die(f"not enough disk: {human(need)} needed, {human(free)} free "
+            f"(keeping a {human(FREE_SPACE_FLOOR)} floor)")
+
+    for f in plan:
+        url = HF_RESOLVE.format(repo=repo, path=urllib.parse.quote(f["path"]))
+        download(url, dest_dir / f["path"], f["size"], Path(f["path"]).name)
+
+    reg = load_reg()
+    reg["models"][name] = {
+        "repo": repo, "quant": quant, "dir": repo,
+        "main": weights[0]["path"],
+        "shards": [w["path"] for w in weights] if len(weights) > 1 else [],
+        "mtp": mtp["path"] if mtp else None,
+        "mmproj": mmproj["path"] if mmproj else None,
+        "bytes": total,
+        "pulled_at": datetime.now(timezone.utc).isoformat(),
+    }
+    save_reg(reg)
+    info(f"{C.GRN}pulled{C.OFF} {C.BOLD}{name}{C.OFF} → llcpp run {name.split(':')[0]}")
+
+
+def cmd_run(args: argparse.Namespace) -> None:
+    reg = load_reg()
+    name = _match_local(args.model, reg, autopull=True)
+    reg = load_reg()
+    port, reg = ensure_server(name, reg, args.ctx, vision=not args.no_vision)
+
+    prompt = " ".join(args.prompt).strip() if args.prompt else ""
+    if not prompt and not sys.stdin.isatty():
+        prompt = sys.stdin.read().strip()
+    if prompt:
+        stream_chat(port, [{"role": "user", "content": prompt}], not args.no_think)
+        return
+    repl(name, port)
+
+
+def cmd_serve(args: argparse.Namespace) -> None:
+    reg = load_reg()
+    name = _match_local(args.model, reg, autopull=True)
+    reg = load_reg()
+    port, _ = ensure_server(name, reg, args.ctx, args.port, vision=not args.no_vision)
+    print(f"{C.GRN}{name}{C.OFF} serving on {C.BOLD}http://127.0.0.1:{port}{C.OFF}")
+    print(f"  OpenAI endpoint  http://127.0.0.1:{port}/v1")
+    print(f"  web UI           http://127.0.0.1:{port}")
+    print(f"{C.DIM}  stop with: llcpp stop {name}{C.OFF}")
+
+
+def cmd_list(args: argparse.Namespace) -> None:
+    reg = reap(load_reg())
+    save_reg(reg)
+    if not reg["models"]:
+        print("no models. Try: llcpp pull unsloth/Qwen3.8-27B-GGUF:Q6")
+        return
+    rows = []
+    for name, m in sorted(reg["models"].items()):
+        srv = reg["servers"].get(name)
+        status = f"{C.GRN}:{srv['port']}{C.OFF}" if srv else f"{C.DIM}—{C.OFF}"
+        feats = ",".join(filter(None, [
+            "mtp" if m.get("mtp") else "",
+            "vision" if m.get("mmproj") else "",
+        ])) or "—"
+        rows.append((name, m["quant"], human(m["bytes"]), feats,
+                     ago(m["pulled_at"]), status))
+    widths = [max(len(str(r[i])) for r in rows + [("NAME", "QUANT", "SIZE", "FEATURES", "PULLED", "")])
+              for i in range(5)]
+    hdr = ("NAME", "QUANT", "SIZE", "FEATURES", "PULLED", "SERVING")
+    print(C.BOLD + "  ".join(h.ljust(widths[i]) for i, h in enumerate(hdr[:5]))
+          + "  " + hdr[5] + C.OFF)
+    for r in rows:
+        print("  ".join(str(r[i]).ljust(widths[i]) for i in range(5)) + "  " + r[5])
+
+
+def cmd_ps(args: argparse.Namespace) -> None:
+    reg = reap(load_reg())
+    save_reg(reg)
+    if not reg["servers"]:
+        print("no running servers")
+        return
+    print(f"{C.BOLD}{'NAME':28s} {'PORT':>5s} {'PID':>7s} {'CTX':>7s}  UPTIME{C.OFF}")
+    for name, s in sorted(reg["servers"].items()):
+        print(f"{name:28s} {s['port']:>5d} {s['pid']:>7d} {s.get('ctx', 0):>7d}  "
+              f"{ago(s['started']).replace(' ago', '')}")
+
+
+def cmd_stop(args: argparse.Namespace) -> None:
+    reg = reap(load_reg())
+    targets = list(reg["servers"]) if args.all else [
+        _match_local(m, reg, autopull=False) for m in args.model]
+    if not targets:
+        die("nothing to stop (pass a model name or --all)")
+    for name in targets:
+        s = reg["servers"].get(name)
+        if not s:
+            info(f"{C.DIM}{name} is not running{C.OFF}")
+            continue
+        try:
+            os.kill(s["pid"], signal.SIGTERM)
+        except OSError:
+            pass
+        for _ in range(40):
+            if not alive(s["pid"]):
+                break
+            time.sleep(0.25)
+        else:
+            try:
+                os.kill(s["pid"], signal.SIGKILL)
+            except OSError:
+                pass
+        del reg["servers"][name]
+        info(f"{C.GRN}stopped{C.OFF} {name}")
+    save_reg(reg)
+
+
+def cmd_rm(args: argparse.Namespace) -> None:
+    reg = reap(load_reg())
+    for ref in args.model:
+        name = _match_local(ref, reg, autopull=False)
+        entry = reg["models"][name]
+
+        if name in reg["servers"]:
+            info(f"{C.DIM}stopping {name} first{C.OFF}")
+            try:
+                os.kill(reg["servers"][name]["pid"], signal.SIGTERM)
+                time.sleep(1)
+            except OSError:
+                pass
+            del reg["servers"][name]
+
+        root = models_dir() / entry["dir"]
+        # Other quants may share this repo directory — only remove our own files.
+        mine = [entry["main"], entry.get("mtp"), entry.get("mmproj")] + entry.get("shards", [])
+        siblings = [n for n, m in reg["models"].items()
+                    if n != name and m["dir"] == entry["dir"]]
+        keep = set()
+        for s in siblings:
+            o = reg["models"][s]
+            keep.update(filter(None, [o["main"], o.get("mtp"), o.get("mmproj")] + o.get("shards", [])))
+
+        freed = 0
+        for rel in filter(None, dict.fromkeys(mine)):
+            if rel in keep:
+                continue
+            p = root / rel
+            if p.exists():
+                freed += p.stat().st_size
+                p.unlink()
+        if not siblings and root.exists():
+            shutil.rmtree(root, ignore_errors=True)
+            parent = root.parent
+            try:
+                parent.rmdir()  # drop the org dir if it is now empty
+            except OSError:
+                pass
+
+        del reg["models"][name]
+        save_reg(reg)
+        info(f"{C.GRN}removed{C.OFF} {name} {C.DIM}({human(freed)} freed){C.OFF}")
+
+
+def cmd_search(args: argparse.Namespace) -> None:
+    import concurrent.futures as cf
+
+    raw = " ".join(args.query).strip()
+    if not raw:
+        die("nothing to search for")
+
+    hw = hw_profile()
+    terms, cons = parse_query(raw)
+    port = None
+    queries = []
+    if args.llm:
+        reg = reap(load_reg())
+        srv = next(iter(reg["servers"].values()), None)
+        if not srv:
+            info(f"{C.DIM}--llm needs a running server; falling back to heuristics{C.OFF}")
+        else:
+            port = srv["port"]
+            got = llm_expand(raw, port)
+            if got:
+                queries = got[0]
+                cons = {**cons, **got[1]}
+                if queries:
+                    info(f"{C.DIM}expanded to {', '.join(repr(q) for q in queries)}{C.OFF}")
+            else:
+                info(f"{C.DIM}local model gave no usable expansion; using heuristics{C.OFF}")
+    if not terms:
+        terms = raw
+    if cons.get("inferred_family"):
+        info(f"{C.DIM}no model named — inferring family {cons['inferred_family']!r} "
+             f"from intent{C.OFF}")
+
+    budget = args.vram * 1000**3 if args.vram else budget_bytes(hw)
+    if cons.get("max_bytes"):
+        budget = min(budget, cons["max_bytes"])
+    prefer = cons.get("prefer", "quality")
+
+    bw = f"~{hw['bandwidth']:.0f} GB/s" if hw["bandwidth"] else "unknown bandwidth"
+    info(f"{C.DIM}{hw['chip']} · {human_ram(hw['ram'])} unified · {bw} · "
+         f"weight budget {human(budget)}{C.OFF}")
+    info(f"{C.DIM}query {terms!r}"
+         + (f" · {', '.join(f'{k}={v}' for k, v in cons.items() if k not in ('max_bytes', 'inferred_family'))}"
+            if any(k not in ('max_bytes', 'inferred_family') for k in cons) else "")
+         + f"{C.OFF}")
+
+    # Retrieval is lexical: HF matches repo names, so a sentence returns nothing.
+    # Probe with the heuristic terms plus any model-suggested variants, and shorten
+    # the heuristic phrase until it matches rather than failing on a long one.
+    per_q = max(args.limit * 2, 12)
+    hits = retrieve(queries, per_q) if queries else []
+    words = terms.split()
+    for n in range(len(words), 0, -1):
+        probe = " ".join(words[:n])
+        extra = retrieve([probe], per_q)
+        if extra:
+            if probe != terms:
+                info(f"{C.DIM}narrowed heuristic query to {probe!r}{C.OFF}")
+                terms = probe
+            seen_ids = {h["id"] for h in hits}
+            hits += [e for e in extra if e["id"] not in seen_ids]
+            break
+    if not hits:
+        die(f"no GGUF repos matched {terms!r}")
+    if len(hits) > 40:  # cap the enrichment fan-out
+        hits = sorted(hits, key=lambda h: h.get("downloads", 0), reverse=True)[:40]
+
+    rows: "list[dict]" = []
+    enriched: "dict[str, dict]" = {}
+    with cf.ThreadPoolExecutor(max_workers=8) as pool:
+        futures = {pool.submit(enrich_repo, h["id"]): h for h in hits}
+        for fut in cf.as_completed(futures):
+            h = futures[fut]
+            meta = fut.result()
+            if not meta:
+                continue
+            enriched[h["id"]] = meta
+            if cons.get("vision") and not meta["vision"]:
+                continue
+            if cons.get("mtp") and not meta["mtp"]:
+                continue
+            pick = choose_quant(meta["quants"], budget, prefer)
+            if not pick and not args.all:
+                continue
+            quant, size = pick or min(meta["quants"].items(), key=lambda kv: kv[1])
+            ratio = active_ratio(h["id"])
+            rows.append({
+                "repo": h["id"], "quant": quant, "size": size,
+                "tps": est_tps(size, ratio, hw["bandwidth"]),
+                "moe": ratio < 0.999, "mtp": meta["mtp"], "vision": meta["vision"],
+                "downloads": h.get("downloads", 0), "fits": bool(pick),
+            })
+
+    if not rows and budget < budget_bytes(hw):
+        # A parsed size cap (especially one an LLM invented) should not be fatal.
+        info(f"{C.YLW}nothing fit in {human(budget)} — widening to this machine's "
+             f"{human(budget_bytes(hw))}{C.OFF}")
+        budget = budget_bytes(hw)
+        for h in hits:
+            meta = enriched.get(h["id"])
+            if not meta:
+                continue
+            if cons.get("vision") and not meta["vision"]:
+                continue
+            pick = choose_quant(meta["quants"], budget, prefer)
+            if not pick:
+                continue
+            ratio = active_ratio(h["id"])
+            rows.append({
+                "repo": h["id"], "quant": pick[0], "size": pick[1],
+                "tps": est_tps(pick[1], ratio, hw["bandwidth"]),
+                "moe": ratio < 0.999, "mtp": meta["mtp"], "vision": meta["vision"],
+                "downloads": h.get("downloads", 0), "fits": True,
+            })
+    if not rows:
+        die(f"nothing matching {terms!r} fits in {human(budget)}. "
+            f"Try --all, --vram N, or different keywords.")
+
+    for r in rows:
+        tps = r["tps"] or 0
+        speed_term = 0.0
+        if tps:
+            speed_term = 0.6 if tps >= 25 else (0.0 if tps >= 12 else -1.5)
+        r["score"] = (math.log10(r["downloads"] + 10)
+                      + (0.8 if r["mtp"] else 0)
+                      + (0.4 if r["vision"] and cons.get("vision") else 0)
+                      + speed_term
+                      + (0.0 if r["fits"] else -3.0))
+    rows.sort(key=lambda r: r["score"], reverse=True)
+
+    # quicksearch returns no download counts; backfill the survivors so ranking
+    # and the reranker both see real popularity numbers.
+    missing = [r for r in rows[:25] if not r["downloads"]]
+    if missing:
+        def _dl(repo):
+            try:
+                return repo, (hf_get(f"{HF_API}/models/{repo}") or {}).get("downloads", 0)
+            except SystemExit:
+                return repo, 0
+            except Exception:
+                return repo, 0
+        with cf.ThreadPoolExecutor(max_workers=8) as pool:
+            for repo, dl in pool.map(_dl, [r["repo"] for r in missing]):
+                for r in missing:
+                    if r["repo"] == repo:
+                        r["downloads"] = dl or 0
+        for r in rows:
+            tps = r["tps"] or 0
+            speed_term = 0.0 if not tps else (0.6 if tps >= 25 else (0.0 if tps >= 12 else -1.5))
+            r["score"] = (math.log10(r["downloads"] + 10) + (0.8 if r["mtp"] else 0)
+                          + (0.4 if r["vision"] and cons.get("vision") else 0)
+                          + speed_term + (0.0 if r["fits"] else -3.0))
+        rows.sort(key=lambda r: r["score"], reverse=True)
+
+    # Stage 2: let the local model judge a shortlist it can actually see. Picking
+    # among concrete candidates is a far easier task than inventing keywords.
+    reasons: "dict[int, str]" = {}
+    if port and not args.no_rerank:
+        shortlist = rows[:15]
+        info(f"{C.DIM}reranking {len(shortlist)} candidates with the local model…{C.OFF}")
+        rr = llm_rerank(raw, shortlist, port)
+        if rr:
+            ordered = [shortlist[i] for i in rr["order"]]
+            rest = [r for r in rows if r not in ordered]
+            for pos, idx in enumerate(rr["order"]):
+                if idx in rr["reasons"]:
+                    reasons[pos] = rr["reasons"][idx]
+            rows = ordered + rest
+        else:
+            info(f"{C.DIM}rerank produced nothing usable; keeping heuristic order{C.OFF}")
+
+    rows = rows[:args.limit]
+
+    if args.json:
+        print(json.dumps(rows, indent=2))
+        return
+
+    print()
+    hdr = f"{'MODEL':52s} {'QUANT':12s} {'SIZE':>9s} {'~TOK/S':>7s}  {'FLAGS':14s} PULLS"
+    print(C.BOLD + hdr + C.OFF)
+    for i, r in enumerate(rows):
+        flags = ",".join(filter(None, [
+            "mtp" if r["mtp"] else "", "vision" if r["vision"] else "",
+            "moe" if r["moe"] else ""])) or "—"
+        tps = f"{r['tps']:.0f}" if r["tps"] else "?"
+        dl = r["downloads"]
+        dls = f"{dl/1e6:.1f}M" if dl >= 1e6 else (f"{dl/1e3:.0f}k" if dl >= 1e3 else str(dl))
+        mark = "" if r["fits"] else f" {C.YLW}(over budget){C.OFF}"
+        print(f"{r['repo'][:52]:52s} {r['quant'][:12]:12s} {human(r['size']):>9s} "
+              f"{tps:>7s}  {flags:14s} {dls}{mark}")
+        if i in reasons:
+            print(f"{C.DIM}    ↳ {reasons[i]}{C.OFF}")
+
+    top = rows[0]
+    print(f"\n{C.DIM}tok/s is a bandwidth estimate"
+          + (", conservative for MoE" if any(r["moe"] for r in rows) else "")
+          + f"; MTP roughly doubles it.{C.OFF}")
+    print(f"{C.BOLD}llcpp pull {top['repo']}:{top['quant']}{C.OFF}")
+
+    if not args.no_docker:
+        dk = search_docker(terms, limit=3)
+        if dk:
+            print(f"\n{C.DIM}also on Docker Hub ai/ (llama-server -dr):{C.OFF}")
+            for repo in dk:
+                tags = [t for t in docker_tags(repo["name"])
+                        if t.get("full_size", 0) <= budget and t["name"] != "latest"]
+                best = max(tags, key=lambda t: t["full_size"], default=None)
+                if best:
+                    print(f"  ai/{repo['name']}:{best['name']}  "
+                          f"{C.DIM}{human(best['full_size'])}{C.OFF}")
+
+
+def _match_local(ref: str, reg: dict, autopull: bool) -> str:
+    """Map a user-typed name onto exactly one pulled model."""
+    if ref in reg["models"]:
+        return ref
+    base = ref.split(":")[0]
+    matches = [n for n in reg["models"] if n.split(":")[0] == base]
+    if ":" in ref:
+        matches = [n for n in matches if n == ref]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        die(f"{ref!r} is ambiguous — be specific: {', '.join(sorted(matches))}")
+    if not autopull:
+        die(f"model {ref!r} is not pulled. See: llcpp list")
+
+    info(f"{C.DIM}{ref} not found locally — pulling{C.OFF}")
+    ns = argparse.Namespace(model=ref, no_mtp=False, no_vision=False, yes=True)
+    cmd_pull(ns)
+    reg2 = load_reg()
+    matches = [n for n in reg2["models"] if n.split(":")[0] == base]
+    if not matches:
+        die(f"pull succeeded but {ref!r} still not registered")
+    return matches[0]
+
+
+# ------------------------------------------------------------------------ CLI
+
+EXAMPLES = """
+examples:
+  llcpp search "fast coding model under 20gb"   find something that fits
+  llcpp search --llm "good for autocomplete"    let a local model expand and rerank
+  llcpp pull unsloth/Qwen3.8-27B-GGUF:Q6_K_XL   download a specific quant
+  llcpp run qwen3.8-27b                         chat (pulls and starts if needed)
+  llcpp run qwen3.8-27b "explain this regex"    one-shot prompt
+  llcpp serve qwen3.8-27b --port 8080           OpenAI endpoint for VS Code/Cursor
+  llcpp list                                    what is downloaded
+  llcpp ps                                      what is running
+  llcpp stop --all                              free the memory
+  llcpp rm qwen3.8-27b                          delete the weights
+
+  llcpp help <command>                          detail on any command
+"""
+
+
+def _help(parser: argparse.ArgumentParser, sub: argparse._SubParsersAction,
+          topic: "str | None") -> None:
+    if topic:
+        target = sub.choices.get(topic)
+        if not target:
+            die(f"no such command: {topic!r}. Try: llcpp help")
+        target.print_help()
+        return
+    parser.print_help()
+    print(EXAMPLES.rstrip())
+
+
+def main() -> None:
+    p = argparse.ArgumentParser(
+        prog="llcpp", description="ollama-style CLI for llama.cpp",
+        epilog="models live under $LLAMA_CACHE (%s)" % cache_root())
+    p.add_argument("-V", "--version", action="version",
+                   version=f"llcpp {__version__}")
+    sub = p.add_subparsers(dest="cmd", metavar="<command>")
+
+    sp = sub.add_parser("pull", help="download a model from Hugging Face")
+    sp.add_argument("model", help="org/repo:quant, or a bare name to search for")
+    sp.add_argument("--no-mtp", action="store_true", help="skip the MTP speculative-decode head")
+    sp.add_argument("--no-vision", action="store_true", help="skip the mmproj vision encoder")
+    sp.add_argument("-y", "--yes", action="store_true", help="do not print search alternatives")
+    sp.set_defaults(func=cmd_pull)
+
+    sr = sub.add_parser("run", help="chat with a model (pulls and starts it if needed)")
+    sr.add_argument("model")
+    sr.add_argument("prompt", nargs="*", help="one-shot prompt; omit for an interactive REPL")
+    sr.add_argument("--ctx", type=int, default=DEFAULT_CTX)
+    sr.add_argument("--no-think", action="store_true", help="disable reasoning")
+    sr.add_argument("--no-vision", action="store_true",
+                    help="skip mmproj; keeps llama.cpp prompt-cache reuse enabled")
+    sr.set_defaults(func=cmd_run)
+
+    ss = sub.add_parser("serve", help="start a model's server and leave it running")
+    ss.add_argument("model")
+    ss.add_argument("--port", type=int, default=None)
+    ss.add_argument("--ctx", type=int, default=DEFAULT_CTX)
+    ss.add_argument("--no-vision", action="store_true",
+                    help="skip mmproj; keeps llama.cpp prompt-cache reuse enabled")
+    ss.set_defaults(func=cmd_serve)
+
+    sq = sub.add_parser("search", help="find models that fit this machine")
+    sq.add_argument("query", nargs="+", help="keywords or plain English")
+    sq.add_argument("-n", "--limit", type=int, default=10, help="results to show")
+    sq.add_argument("--vram", type=float, default=None,
+                    help="override the weight budget, in GB")
+    sq.add_argument("--all", action="store_true", help="include models that do not fit")
+    sq.add_argument("--llm", action="store_true",
+                    help="use a running local model to expand the query into search "
+                         "terms, then rerank the results (~10s)")
+    sq.add_argument("--no-docker", action="store_true", help="skip the Docker Hub section")
+    sq.add_argument("--no-rerank", action="store_true",
+                    help="with --llm, expand queries but skip the rerank pass")
+    sq.add_argument("--json", action="store_true")
+    sq.set_defaults(func=cmd_search)
+
+    sl = sub.add_parser("list", help="list pulled models")
+    sl.set_defaults(func=cmd_list)
+
+    sps = sub.add_parser("ps", help="list running servers")
+    sps.set_defaults(func=cmd_ps)
+
+    st = sub.add_parser("stop", help="stop a running server")
+    st.add_argument("model", nargs="*")
+    st.add_argument("--all", action="store_true")
+    st.set_defaults(func=cmd_stop)
+
+    srm = sub.add_parser("rm", help="delete a pulled model")
+    srm.add_argument("model", nargs="+")
+    srm.set_defaults(func=cmd_rm)
+
+    sh = sub.add_parser("help", help="show help for a command")
+    sh.add_argument("topic", nargs="?", metavar="<command>")
+    sh.set_defaults(func=lambda a: _help(p, sub, a.topic))
+
+    args = p.parse_args()
+    if not args.cmd:          # bare `llcpp` prints help instead of an argparse error
+        p.print_help()
+        sys.exit(0)
+    try:
+        args.func(args)
+    except KeyboardInterrupt:
+        print()
+        sys.exit(130)
+
+
+if __name__ == "__main__":
+    main()
