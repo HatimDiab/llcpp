@@ -1,170 +1,198 @@
 # llcpp
 
-An ollama-style CLI for llama.cpp. Single Python file, stdlib only, no daemon.
+An [ollama](https://ollama.com)-style CLI for [llama.cpp](https://github.com/ggml-org/llama.cpp).
+Pull GGUF models from Hugging Face, run them, and serve them to your editor —
+without a wrapper process sitting between you and the inference.
+
+Single Python file, standard library only, no daemon.
+
+```console
+$ llcpp search "fast coding model under 20gb"
+Apple M5 Max · 128 GB unified · ~614 GB/s · weight budget 20.0 GB
+
+MODEL                                       QUANT        SIZE  ~TOK/S  FLAGS   PULLS
+unsloth/Qwen3-Coder-30B-A3B-Instruct-GGUF   IQ4_XS    16.4 GB     206  moe     12.7M
+Qwen/Qwen2.5-Coder-7B-Instruct-GGUF         Q4_K_M     4.7 GB      92  —       245k
+
+$ llcpp pull unsloth/Qwen3.8-27B-GGUF:Q6_K_XL
+$ llcpp run qwen3.8-27b
+```
+
+## Install
 
 ```bash
-llcpp pull unsloth/Qwen3.8-27B-GGUF:Q6_K_XL
-llcpp run  qwen3.8-27b
-llcpp list
-llcpp rm   qwen3.8-27b
+brew install HatimDiab/tap/llcpp
 ```
+
+That pulls in `llama.cpp` as a dependency. To run from source instead, the script
+needs only Python 3.9+ and `llama-server` on `PATH`.
 
 ## Why not just use ollama
 
-Ollama is easier, but on this hardware it leaves a lot on the table:
+Ollama is easier. On Apple Silicon it also leaves a lot on the table:
 
-- **It cannot do MTP speculative decoding.** On Qwen3.8-27B that is measured at
-  55–68% draft acceptance, roughly **2x decode throughput**. `llcpp` detects an
-  `MTP/` folder in a repo and wires `--spec-type draft-mtp` automatically.
-- **Its Go wrapper costs throughput** — published benchmarks put raw llama.cpp at
-  89 tok/s where ollama gets 43 on the same MoE model. `llcpp` execs
+- **It cannot do MTP speculative decoding.** Several recent models ship a
+  multi-token-prediction head. llcpp finds it and wires it up, which on
+  Qwen3.8-27B measured 55–68% draft acceptance — roughly **18 → 29-38 tok/s**.
+- **Its wrapper costs throughput.** Published benchmarks put raw llama.cpp at
+  89 tok/s where ollama gets 43 on the same MoE model. llcpp starts
   `llama-server` directly and gets out of the way.
-- **You keep llama.cpp's full flag surface.** `--ctx`, `--no-vision`, and anything
-  else you want to add to `build_cmd`.
+- **You keep llama.cpp's whole flag surface**, rather than whatever a wrapper
+  chose to expose.
+
+What you give up: no idle unload, no Modelfile equivalent. See
+[Limitations](#limitations).
 
 ## Commands
 
 | | |
 |---|---|
-| `search <query>` | find models that fit this machine. Plain English works |
-| `pull <ref>` | download from Hugging Face. `--no-mtp`, `--no-vision` |
-| `run <name> [prompt]` | chat. Auto-pulls and auto-starts. No prompt → REPL |
-| `list` | pulled models, with size, features, and which port each is serving on |
-| `rm <name>...` | delete weights and deregister |
-| `serve <name>` | start a server and leave it up. `--port`, `--ctx` |
-| `ps` | running servers |
-| `stop <name> \| --all` | shut one down |
+| `search <query>` | find models that fit this machine; plain English works |
+| `pull <ref>` | download a model, plus its MTP head and vision encoder |
+| `run <name> [prompt]` | chat; starts the server if needed. No prompt → REPL |
+| `serve <name>` | start a server and leave it up, for editors |
+| `list` | what is downloaded |
+| `ps` | what is running |
+| `stop <name>` or `--all` | shut a server down |
+| `rm <name>...` | delete weights |
+| `help [command\|topic]` | detail on anything |
+
+The built-in help goes further than this table:
+
+```bash
+llcpp help            # overview
+llcpp help search     # one command, with examples
+llcpp help quants     # concepts: refs, quants, mtp, hardware, storage, editors
+```
+
+## Naming models
+
+```
+unsloth/Qwen3.8-27B-GGUF:UD-Q6_K_XL   exact repo and quant
+unsloth/Qwen3.8-27B-GGUF:Q6           fuzzy quant → UD-Q6_K
+unsloth/Qwen3.8-27B-GGUF              no quant → Q4_K_M
+qwen3.8-27b                           a model you already pulled
+qwen3-coder                           not local → Hugging Face is searched
+```
+
+Matching prefers an exact hit, then the shortest prefix, and breaks ties toward
+Unsloth `UD-` dynamic quants, which are better at the same size. A partial ref
+resolves to the *highest-quality* match, so `:Q8` gives `UD-Q8_K_XL`, not `Q8_0`.
+
+## Auto-detection
+
+Three things are picked up from a repo without being asked for:
+
+- **MTP heads** (`MTP/mtp-*.gguf`) → `--spec-type draft-mtp`, the single largest
+  speed lever on models that have one
+- **Vision encoders** (`mmproj-*.gguf`) → prefers `F16` over `BF16`, the safer
+  choice on Metal
+- **Split shards** (`*-00001-of-00003.gguf`) → all downloaded, first one passed
 
 ## search
 
-```bash
-llcpp search qwen3 coder
-llcpp search "a fast coding model that fits in 20gb"
-llcpp search "best vision model I can run locally"
-```
+Results are filtered to what actually runs on your machine, and annotated with an
+estimated decode speed.
 
-Ranks by download count, then filters hard on what actually fits, and prints an
-estimated decode speed for each. Flags show `mtp`, `vision`, `moe`.
+**Hardware profile** comes from `machdep.cpu.brand_string`, `hw.memsize`, and
+`iogpu.wired_limit_mb` (or the 75% macOS default). The weight budget leaves
+headroom for the KV cache; override it with `--vram N`.
 
-**Hardware profile** is auto-detected — chip via `machdep.cpu.brand_string`, RAM
-via `hw.memsize`, GPU budget from `iogpu.wired_limit_mb` or the 75% default.
-Bandwidth comes from a per-chip table; only the M5 Max entry is vendor-confirmed,
-so override with `LLCPP_BANDWIDTH=546` if yours is wrong.
+**Speed estimate** is `bandwidth / bytes-per-token × efficiency`, with 0.70 for
+dense models and 0.55 for MoE. Calibrated on an M5 Max: predicted 17 tok/s for
+Qwen3.8-27B Q6_K_XL against 18 measured. MoE models are detected from `30B-A3B`
+naming and estimated on *active* parameters, so they rank realistically instead
+of looking slow.
 
-**Speed estimate** is `bandwidth / bytes-per-token * efficiency` (0.70 dense, 0.55
-MoE). Validated against this machine: predicted 17 tok/s for Qwen3.8-27B Q6_K_XL,
-measured 18 without MTP. MoE models are detected from `30B-A3B`-style names and
-estimated on active params, so they show realistically high numbers.
+Bandwidth comes from a per-chip table, of which only the M5 Max entry is
+vendor-confirmed. Set `LLCPP_BANDWIDTH=<GB/s>` if yours is wrong.
 
-Constraints parsed from plain English: size caps (`under 20gb`, `fits in 32 GB`),
-`vision`/`multimodal`, and speed-vs-quality intent (`fast` / `best`). When a query
-describes a job but names no model, an intent table steers it at a suitable family
-and says so.
+**Plain English** is parsed for size caps (`under 20gb`), modality (`vision`),
+and intent (`fast` vs `best`). When a query describes a job but names no model,
+an intent table steers it at a suitable family and says so.
 
 ### `--llm`: retrieve, then rerank
 
-Hugging Face search matches **repo names only** — a natural sentence literally
-returns zero results. So the model is never asked to be the search engine. With a
-server running, `--llm` runs a two-stage pipeline:
+Hugging Face search matches **repo names only** — a natural sentence returns zero
+results. So the model is never asked to be the search engine. With a server
+running, `--llm` runs four stages:
 
-1. **Expand.** The model turns the request into 2-4 short *name fragments*
-   ("starcoder2", "qwen2.5 coder", "deepseek coder") plus constraints. Several
-   cheap guesses beat one; a wrong one costs a single HTTP request.
-2. **Retrieve.** Those, plus the heuristic query, fan out across both HF endpoints
-   (`?search=` and `quicksearch`), unioned and deduped.
-3. **Fit.** Enrich with file trees, filter to what runs on this machine.
-4. **Rerank.** The model orders the surviving shortlist against the original
-   request and gives a one-line reason per pick.
+1. **Expand** — the model turns the request into 2–4 short *name fragments*
+   (`starcoder2`, `qwen2.5 coder`, `deepseek coder`) plus constraints. Several
+   cheap guesses beat one, and a wrong one costs a single HTTP request.
+2. **Retrieve** — those, plus the heuristic query, fan out across both Hugging
+   Face search endpoints, unioned and deduped.
+3. **Fit** — enrich with file trees, filter to what runs here.
+4. **Rerank** — the model orders the survivors against the original request and
+   gives a one-line reason for each.
 
-Stage 4 is where a local model actually earns its keep: judging concrete
-candidates it can see is far easier than inventing keywords. An earlier version
-did it the other way round (model → keywords → search) and returned obscure PHP
-fine-tunes for an autocomplete query; the same query now returns
-Qwen2.5-Coder-1.5B at ~403 tok/s, top-ranked, "ideal for autocomplete".
+Stage 4 is where a local model earns its keep: judging concrete candidates it can
+see is far easier than inventing keywords. An earlier version did it the other
+way round, and returned obscure PHP fine-tunes for an autocomplete query; the
+same query now returns Qwen2.5-Coder-1.5B at ~403 tok/s, "ideal for autocomplete".
 
-Every stage degrades to the heuristic path if the model returns junk. Costs about
-10s. `--no-rerank` keeps expansion but skips stage 4.
-
-Other flags: `--vram N` to override the budget, `--all` to include models that do
-not fit, `-n` for result count, `--json`, `--no-docker`, `--no-rerank`.
+Every stage falls back to the heuristic path if the model returns junk. Costs
+about 10 seconds.
 
 ### Portals
 
-Hugging Face is primary. **Docker Hub's `ai/` namespace** (99 curated models, what
-`llama-server -dr` pulls) is shown as a secondary section; its tags carry quant and
-size directly. ModelScope's public API 404s, and the Ollama registry has no search
-endpoint — neither is usable here.
+Hugging Face is primary. **Docker Hub's `ai/` namespace** — 99 curated models,
+what `llama-server -dr` pulls from — appears as a secondary section. ModelScope's
+public API returns 404, and the Ollama registry has no search endpoint.
 
-## Model refs
-
-```
-unsloth/Qwen3.8-27B-GGUF:UD-Q6_K_XL   explicit
-unsloth/Qwen3.8-27B-GGUF:Q6           fuzzy quant → UD-Q6_K
-unsloth/Qwen3.8-27B-GGUF              defaults to Q4_K_M
-qwen3.8-27b                           local model, or HF search if not pulled
-```
-
-Quant matching prefers exact, then shortest prefix, and breaks ties toward
-unsloth `UD-` dynamic quants (better quality at the same size). Partial refs
-resolve to the *highest-quality* match, so `:Q8` gives you `UD-Q8_K_XL`, not
-`Q8_0` — be explicit if you care.
-
-## What it auto-detects
-
-- **MTP heads** (`MTP/mtp-*.gguf`) → speculative decoding, the single biggest
-  perf lever on hybrid Qwen models
-- **Vision encoders** (`mmproj-*.gguf`) → prefers `F16` over `BF16`, which is the
-  safer choice on the Metal backend
-- **Split shards** (`*-00001-of-00003.gguf`) → downloads all, passes the first
-
-## Storage
-
-Everything under `$LLAMA_CACHE` (default `~/.cache/llama.cpp`), matching the
-`~/.cache/<provider>/` convention:
-
-```
-$LLAMA_CACHE/
-  models/<org>/<repo>/…      weights, mirroring the HF repo layout
-  registry.json              name → files, plus running servers
-  logs/<model>.log           llama-server output
-```
-
-Because the layout mirrors Hugging Face exactly, you can drop files in by hand and
-`llcpp pull` will find them already complete rather than re-downloading.
-
-## Gotcha: vision vs prompt caching
-
-llama-server disables `--cache-reuse` whenever an mmproj is loaded:
-
-```
-cache_reuse is not supported by multimodal, it will be disabled
-```
-
-For coding assistants that resend the same file context every turn, prefix cache
-reuse is usually worth more than image input. Use `llcpp serve <m> --no-vision` to
-keep it. Vision is on by default.
-
-## Editor integration
+## Editors
 
 ```bash
 llcpp serve qwen3.8-27b --port 8080 --ctx 131072
 ```
 
-Point Continue (or anything OpenAI-compatible) at `http://127.0.0.1:8080/v1`. The
-served model id is the name without its quant tag — `qwen3.8-27b`. llama.cpp's own
-web UI is at the port root.
+OpenAI-compatible API at `/v1`, llama.cpp's own web UI at the root. The served
+model id is the short name without its quant tag.
 
-## Not implemented
+`llcpp help editors` has a working Continue config and two caveats worth reading:
+Cursor's own base-URL override proxies through Cursor's servers and cannot reach
+`127.0.0.1`, and loading a vision encoder makes llama-server disable prompt-cache
+reuse — which for coding is usually the worse trade.
 
-- No idle unload. llama-server holds the model until `llcpp stop`; ollama drops it
-  after 5 minutes. Adding that needs a supervisor process.
-- No Modelfile equivalent — no custom system prompts or parameter presets baked
-  into a named model.
-- Single-stream downloads. Fine at ~40 MB/s; no multi-connection acceleration.
-- `search` ranking leans on download counts. That favours established repos and
-  will under-rank a genuinely better model published last week.
-- `--llm` expansion is limited by the local model's knowledge cutoff. Ask for "the
-  smartest reasoning model" and it suggests families it knows, so results skew
-  older than what is actually state of the art.
-- Speed estimates ignore context length. A long prompt shifts the bottleneck from
-  weight streaming to KV traffic and the numbers will read high.
+## Storage
+
+```
+$LLAMA_CACHE/                    default ~/.cache/llama.cpp
+  models/<org>/<repo>/…          weights, mirroring the Hugging Face repo layout
+  registry.json                  what is pulled, and what is running
+  logs/<model>.log               llama-server output
+```
+
+Because the layout mirrors Hugging Face exactly, you can drop files in by hand
+and `pull` will find them already complete instead of re-downloading. Interrupted
+downloads resume on re-run.
+
+Environment: `LLAMA_CACHE`, `HF_TOKEN`, `HF_HOME`, `LLCPP_BANDWIDTH`, `NO_COLOR`.
+
+## Limitations
+
+- **No idle unload.** llama-server holds the model until `llcpp stop`; ollama
+  drops it after five minutes. Adding that needs a supervisor process.
+- **No Modelfile equivalent** — no system prompts or parameter presets baked into
+  a named model.
+- **Single-stream downloads.** Fine at ~40 MB/s; no multi-connection acceleration.
+- **`search` ranking leans on download counts**, which favours established repos
+  and under-ranks a genuinely better model published last week.
+- **`--llm` expansion is bounded by the local model's knowledge cutoff.** Ask for
+  "the smartest reasoning model" and it proposes families it knows, so results
+  skew older than the actual state of the art.
+- **Speed estimates ignore context length.** At long prompts the bottleneck moves
+  from streaming weights to KV traffic, and the real number will be lower.
+
+## Requirements
+
+Python 3.9+ and `llama-server` on `PATH`. Hardware detection and the speed model
+are macOS/Apple Silicon specific; everything else is portable, and elsewhere
+`search` simply omits the tok/s column.
+
+## License
+
+MIT — see [LICENSE](LICENSE).
+
+llcpp invokes `llama-server` as a separate process and neither links nor bundles
+llama.cpp, which is independently MIT licensed by the ggml authors.

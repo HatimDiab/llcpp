@@ -37,7 +37,7 @@ DEFAULT_QUANT = "Q4_K_M"          # same default as ollama and `llama-server -hf
 DEFAULT_CTX = 32768
 PORT_BASE = 8080
 FREE_SPACE_FLOOR = 10 * 1024**3   # refuse a pull that would leave less than this
-__version__ = "0.1.0"
+__version__ = "0.2.0"
 UA = {"User-Agent": "llcpp/" + __version__}
 
 # Quant tokens as they appear in GGUF filenames: Q4_K_M, UD-Q6_K_XL, IQ2_XXS, BF16...
@@ -1380,33 +1380,218 @@ def _match_local(ref: str, reg: dict, autopull: bool) -> str:
 
 # ------------------------------------------------------------------------ CLI
 
-EXAMPLES = """
-examples:
-  llcpp search "fast coding model under 20gb"   find something that fits
-  llcpp search --llm "good for autocomplete"    let a local model expand and rerank
-  llcpp pull unsloth/Qwen3.8-27B-GGUF:Q6_K_XL   download a specific quant
-  llcpp run qwen3.8-27b                         chat (pulls and starts if needed)
-  llcpp run qwen3.8-27b "explain this regex"    one-shot prompt
-  llcpp serve qwen3.8-27b --port 8080           OpenAI endpoint for VS Code/Cursor
-  llcpp list                                    what is downloaded
-  llcpp ps                                      what is running
-  llcpp stop --all                              free the memory
-  llcpp rm qwen3.8-27b                          delete the weights
+OVERVIEW = """\
+llcpp — an ollama-style CLI for llama.cpp
 
-  llcpp help <command>                          detail on any command
+  Downloads GGUF models from Hugging Face and runs them through llama-server,
+  with no wrapper process between you and the inference. It auto-detects the
+  things that actually matter for speed: MTP speculative-decode heads, mmproj
+  vision encoders, and split shards.
+
+models
+  search    find models that fit this machine (plain English works)
+  pull      download a model
+  list      show what is downloaded
+  rm        delete a model
+
+running
+  run       chat with a model, starting it if needed
+  serve     start a server and leave it up (for editors)
+  ps        show running servers
+  stop      shut a server down
+
+  help      this text; `llcpp help <command>` or `llcpp help <topic>`
+
+topics
+  refs      how to name a model
+  quants    what Q4_K_M and friends mean, and which to pick
+  mtp       speculative decoding, the biggest speed lever here
+  hardware  how the fit and tok/s estimates are worked out
+  storage   where files live and which env vars move them
+  editors   wiring it into VS Code or Cursor
+
+examples
+  llcpp search "fast coding model under 20gb"
+  llcpp pull unsloth/Qwen3.8-27B-GGUF:Q6_K_XL
+  llcpp run qwen3.8-27b
+  llcpp serve qwen3.8-27b --port 8080 --ctx 131072
 """
 
+TOPICS = {
+"refs": """\
+Naming a model
 
-def _help(parser: argparse.ArgumentParser, sub: argparse._SubParsersAction,
+  unsloth/Qwen3.8-27B-GGUF:UD-Q6_K_XL   exact repo and quant
+  unsloth/Qwen3.8-27B-GGUF:Q6           fuzzy quant, resolves to UD-Q6_K
+  unsloth/Qwen3.8-27B-GGUF              no quant given, defaults to Q4_K_M
+  qwen3.8-27b                           a model you already pulled
+  qwen3-coder                           not local, so Hugging Face is searched
+
+Quant matching prefers an exact hit, then the shortest prefix, and breaks ties
+toward unsloth UD- dynamic quants because they are better at the same size.
+
+A partial ref resolves to the HIGHEST-QUALITY match, so `:Q8` gives you
+UD-Q8_K_XL rather than Q8_0. Name the full quant when that matters.
+
+Once pulled, a model gets a short name like `qwen3.8-27b:ud-q6_k_xl`. You can
+use just `qwen3.8-27b` as long as it is unambiguous; if two quants of the same
+model are downloaded, llcpp will say so and ask you to be specific.
+""",
+
+"quants": """\
+Choosing a quant
+
+Quantisation trades weight precision for size, and size is what determines
+speed here — decode is memory-bandwidth bound, so a model half the size runs
+close to twice as fast.
+
+  Q8_0 / Q8_K_XL   ~8 bits.  Indistinguishable from full precision.
+  Q6_K / Q6_K_XL   ~6 bits.  The usual sweet spot on a large-memory machine.
+  Q5_K_M           ~5 bits.  Mild, rarely noticeable loss.
+  Q4_K_M           ~4 bits.  The default. Good quality, half the size of Q8.
+  IQ4_XS           ~4 bits.  Smaller than Q4_K_M at similar quality.
+  Q3_K / IQ3       ~3 bits.  Visible degradation. Use only if it will not fit.
+  Q2_K / IQ2 / IQ1 2 bits or less. Badly damaged. A last resort.
+  BF16 / F16       16 bits. Twice the size of Q8 for no measurable gain.
+                   `search` deliberately never recommends these.
+
+The UD- prefix marks Unsloth Dynamic quants, which vary precision per tensor
+and beat a plain quant of the same size. Prefer them when offered.
+
+Suffixes _S, _M, _L and _XL are small/medium/large variants within a family:
+larger keeps more precision in the sensitive tensors and costs a little size.
+""",
+
+"mtp": """\
+MTP — multi-token prediction
+
+Some repos ship an MTP head next to the weights, usually in an MTP/ folder.
+It predicts the next token or two ahead of the main model, so llama-server can
+draft several tokens and verify them in one pass. When drafts are accepted
+often, decoding gets dramatically faster.
+
+llcpp downloads that head automatically and starts the server with:
+
+  -md <mtp.gguf> --spec-type draft-mtp --spec-draft-n-max 3 --spec-draft-n-min 1
+
+Measured on an M5 Max with Qwen3.8-27B UD-Q6_K_XL: 55-68% of drafts accepted,
+about 18 tok/s without it against 29-38 tok/s with it.
+
+`list` marks models that have one in the FEATURES column, and `search` gives
+them a ranking bonus. Skip it with `pull --no-mtp` if you want the disk back.
+
+Reports elsewhere that MTP is a net loss come from multi-GPU NVIDIA setups,
+where the recurrent-state checkpoint has to cross PCIe on every draft. On
+unified memory that copy is nearly free, so the trade works out very
+differently. ollama cannot do this at all.
+""",
+
+"hardware": """\
+How fit and speed are estimated
+
+  chip        machdep.cpu.brand_string
+  memory      hw.memsize
+  GPU budget  iogpu.wired_limit_mb, or 75% of RAM when that is unset,
+              which is the macOS default cap for GPU-addressable memory
+
+The weight budget subtracts roughly 15% plus 3 GB from that, leaving room for
+the KV cache and compute buffers. Override it with `search --vram N`.
+
+Speed estimate:
+
+  tok/s  ~=  bandwidth / bytes-read-per-token  *  efficiency
+
+with efficiency 0.70 for dense models and 0.55 for MoE, which pays extra for
+routing. Bandwidth comes from a per-chip table; only the M5 Max figure is
+vendor-confirmed, so set LLCPP_BANDWIDTH=<GB/s> if yours looks wrong.
+
+MoE models are detected from names like 30B-A3B and estimated on their ACTIVE
+parameters, which is why a 36 GB MoE can be far faster than a 25 GB dense one.
+
+These are estimates for ranking, not benchmarks. They ignore context length —
+at long prompts the bottleneck shifts from streaming weights to KV traffic and
+the real number will be lower. MTP roughly doubles what is shown.
+""",
+
+"storage": """\
+Where things live
+
+  $LLAMA_CACHE/                       default ~/.cache/llama.cpp
+    models/<org>/<repo>/...           weights, mirroring the Hugging Face repo
+    registry.json                     what is pulled, and what is running
+    logs/<model>.log                  llama-server output
+    docker_catalog.json               cached Docker Hub index, 24h TTL
+
+The layout mirrors Hugging Face exactly, so you can drop files in by hand and
+`llcpp pull` will find them already complete instead of downloading again.
+
+Environment
+  LLAMA_CACHE        move everything above
+  HF_TOKEN           for gated repos; otherwise $HF_HOME/token is read
+  HF_HOME            where that token is looked up, default ~/.cache/huggingface
+  LLCPP_BANDWIDTH    override the memory bandwidth used for estimates, in GB/s
+  NO_COLOR           disable colour
+
+Downloads resume. If one is interrupted, run the same `pull` again and it
+picks up where it stopped rather than starting over.
+""",
+
+"editors": """\
+Using it from VS Code or Cursor
+
+Start a server and leave it up:
+
+  llcpp serve qwen3.8-27b --port 8080 --ctx 131072
+
+That exposes an OpenAI-compatible API at http://127.0.0.1:8080/v1 and
+llama.cpp's own web UI at the port root. The model id it serves is the short
+name without the quant tag, e.g. `qwen3.8-27b`.
+
+For Continue, in ~/.continue/config.yaml:
+
+  models:
+    - name: Qwen3.8 27B
+      provider: openai
+      model: qwen3.8-27b
+      apiBase: http://127.0.0.1:8080/v1
+      apiKey: none
+      roles: [chat, edit, apply]
+
+Two things worth knowing:
+
+Cursor's own "Override OpenAI Base URL" proxies through Cursor's servers and
+cannot reach 127.0.0.1. Use the Continue extension there instead.
+
+Loading a vision encoder makes llama-server disable prompt-cache reuse:
+"cache_reuse is not supported by multimodal". For coding, where the same file
+context is resent every turn, that cache is usually worth more than image
+input — start with `serve --no-vision` to keep it.
+
+Do not point tab-autocomplete at a large reasoning model. Run a small one
+separately for that; `llcpp search "autocomplete"` will find candidates.
+""",
+}
+
+
+def _help(parser: argparse.ArgumentParser, sub: "argparse._SubParsersAction",
           topic: "str | None") -> None:
-    if topic:
-        target = sub.choices.get(topic)
-        if not target:
-            die(f"no such command: {topic!r}. Try: llcpp help")
+    if not topic:
+        print(OVERVIEW.rstrip())
+        return
+    target = sub.choices.get(topic)
+    if target:
         target.print_help()
         return
-    parser.print_help()
-    print(EXAMPLES.rstrip())
+    if topic in TOPICS:
+        print(TOPICS[topic].rstrip())
+        return
+    known = ", ".join(sorted(list(sub.choices) + list(TOPICS)))
+    die(f"no such command or topic: {topic!r}\n  known: {known}")
+
+
+def _sp(sub: "argparse._SubParsersAction", name: str, help_: str, epilog: str):
+    return sub.add_parser(name, help=help_, epilog=epilog,
+                          formatter_class=argparse.RawDescriptionHelpFormatter)
 
 
 def main() -> None:
@@ -1417,14 +1602,37 @@ def main() -> None:
                    version=f"llcpp {__version__}")
     sub = p.add_subparsers(dest="cmd", metavar="<command>")
 
-    sp = sub.add_parser("pull", help="download a model from Hugging Face")
+    sp = _sp(sub, "pull", "download a model from Hugging Face", """
+examples:
+  llcpp pull unsloth/Qwen3.8-27B-GGUF:Q6_K_XL   an exact quant
+  llcpp pull unsloth/Qwen3.8-27B-GGUF:Q6        fuzzy, picks the best Q6
+  llcpp pull unsloth/Qwen3.8-27B-GGUF           defaults to Q4_K_M
+  llcpp pull qwen3-coder                        searches Hugging Face by name
+
+An MTP head and a vision encoder are fetched too when the repo has them; see
+`llcpp help mtp`. Split shards are followed automatically. Downloads resume,
+so re-run the same command after an interruption. See also `llcpp help refs`
+and `llcpp help quants`.
+""")
     sp.add_argument("model", help="org/repo:quant, or a bare name to search for")
     sp.add_argument("--no-mtp", action="store_true", help="skip the MTP speculative-decode head")
     sp.add_argument("--no-vision", action="store_true", help="skip the mmproj vision encoder")
     sp.add_argument("-y", "--yes", action="store_true", help="do not print search alternatives")
     sp.set_defaults(func=cmd_pull)
 
-    sr = sub.add_parser("run", help="chat with a model (pulls and starts it if needed)")
+    sr = _sp(sub, "run", "chat with a model (pulls and starts it if needed)", """
+examples:
+  llcpp run qwen3.8-27b                      interactive chat
+  llcpp run qwen3.8-27b "explain this regex" one-shot, prints and exits
+  git diff | llcpp run qwen3.8-27b           reads a piped prompt from stdin
+  llcpp run qwen3.8-27b --no-think           skip reasoning, much faster edits
+
+Starts the server if it is not already up, and reuses it if it is. The server
+outlives the command; stop it with `llcpp stop`.
+
+In the REPL: /bye to exit, /clear to forget the conversation, /think on|off,
+/web to open llama.cpp's browser UI, /? for the list.
+""")
     sr.add_argument("model")
     sr.add_argument("prompt", nargs="*", help="one-shot prompt; omit for an interactive REPL")
     sr.add_argument("--ctx", type=int, default=DEFAULT_CTX)
@@ -1433,7 +1641,16 @@ def main() -> None:
                     help="skip mmproj; keeps llama.cpp prompt-cache reuse enabled")
     sr.set_defaults(func=cmd_run)
 
-    ss = sub.add_parser("serve", help="start a model's server and leave it running")
+    ss = _sp(sub, "serve", "start a model\'s server and leave it running", """
+examples:
+  llcpp serve qwen3.8-27b                        first free port from 8080
+  llcpp serve qwen3.8-27b --port 8080            pin the port
+  llcpp serve qwen3.8-27b --ctx 131072           bigger context window
+  llcpp serve qwen3.8-27b --no-vision            keep prompt-cache reuse
+
+Exposes an OpenAI-compatible API at /v1 and llama.cpp's web UI at the root.
+For wiring this into VS Code or Cursor, see `llcpp help editors`.
+""")
     ss.add_argument("model")
     ss.add_argument("--port", type=int, default=None)
     ss.add_argument("--ctx", type=int, default=DEFAULT_CTX)
@@ -1441,7 +1658,22 @@ def main() -> None:
                     help="skip mmproj; keeps llama.cpp prompt-cache reuse enabled")
     ss.set_defaults(func=cmd_serve)
 
-    sq = sub.add_parser("search", help="find models that fit this machine")
+    sq = _sp(sub, "search", "find models that fit this machine", """
+examples:
+  llcpp search qwen3 coder                        keyword search
+  llcpp search "fast coding model under 20gb"     size cap and intent parsed
+  llcpp search "best vision model I can run"      filters to multimodal repos
+  llcpp search --llm "good for autocomplete"      local model expands + reranks
+  llcpp search mistral --vram 16                  pretend a smaller budget
+
+Only models that fit are shown; --all includes the rest. Results carry an
+estimated tok/s for this machine and flags for mtp, vision and moe.
+
+Hugging Face matches repo NAMES, not descriptions, so a long sentence is
+narrowed to keywords first. --llm instead asks a running local model for
+several name guesses, then has it rerank what came back, which handles
+requests that never name a model. See `llcpp help hardware`.
+""")
     sq.add_argument("query", nargs="+", help="keywords or plain English")
     sq.add_argument("-n", "--limit", type=int, default=10, help="results to show")
     sq.add_argument("--vram", type=float, default=None,
@@ -1456,28 +1688,54 @@ def main() -> None:
     sq.add_argument("--json", action="store_true")
     sq.set_defaults(func=cmd_search)
 
-    sl = sub.add_parser("list", help="list pulled models")
+    sl = _sp(sub, "list", "list pulled models", """
+Shows each model's quant, on-disk size, detected features (mtp, vision) and
+the port it is serving on, if any.
+""")
     sl.set_defaults(func=cmd_list)
 
-    sps = sub.add_parser("ps", help="list running servers")
+    sps = _sp(sub, "ps", "list running servers", """
+Dead servers are pruned from the registry whenever this runs, so what it
+prints is what is actually alive.
+""")
     sps.set_defaults(func=cmd_ps)
 
-    st = sub.add_parser("stop", help="stop a running server")
+    st = _sp(sub, "stop", "stop a running server", """
+examples:
+  llcpp stop qwen3.8-27b     stop one
+  llcpp stop --all           stop everything and free the memory
+
+SIGTERM first, SIGKILL after 10s. Weights are not touched; use `rm` for that.
+""")
     st.add_argument("model", nargs="*")
     st.add_argument("--all", action="store_true")
     st.set_defaults(func=cmd_stop)
 
-    srm = sub.add_parser("rm", help="delete a pulled model")
+    srm = _sp(sub, "rm", "delete a pulled model", """
+examples:
+  llcpp rm qwen3.8-27b            delete one
+  llcpp rm qwen3-0.6b qwen3-vl    delete several
+
+Stops the server first if the model is running. Only files belonging to this
+quant are removed, so another quant from the same repo survives.
+""")
     srm.add_argument("model", nargs="+")
     srm.set_defaults(func=cmd_rm)
 
-    sh = sub.add_parser("help", help="show help for a command")
-    sh.add_argument("topic", nargs="?", metavar="<command>")
+    sh = _sp(sub, "help", "show help for a command or topic", """
+examples:
+  llcpp help            overview, commands and topics
+  llcpp help search     detail on one command
+  llcpp help quants     explain a concept
+
+topics: refs, quants, mtp, hardware, storage, editors
+""")
+    sh.add_argument("topic", nargs="?", metavar="<command-or-topic>")
     sh.set_defaults(func=lambda a: _help(p, sub, a.topic))
 
     args = p.parse_args()
     if not args.cmd:          # bare `llcpp` prints help instead of an argparse error
-        p.print_help()
+        print(OVERVIEW.rstrip())
         sys.exit(0)
     try:
         args.func(args)
