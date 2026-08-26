@@ -164,8 +164,26 @@ $LLAMA_CACHE/                    default ~/.cache/llama.cpp
 ```
 
 Because the layout mirrors Hugging Face exactly, you can drop files in by hand
-and `pull` will find them already complete instead of re-downloading. Interrupted
-downloads resume on re-run.
+and `pull` will find them already complete instead of re-downloading.
+
+### Interrupted downloads
+
+Ctrl-C keeps what has transferred. `list` shows it under **unfinished**, and
+pulling the same model again asks what to do rather than silently continuing a
+days-old partial:
+
+```console
+$ llcpp pull TheBloke/WizardLM-...-30B-GGUF:Q8_0
+partial download found: 1.3 GB of 34.6 GB (3.8%), interrupted 2 hours ago
+  resume? [Y/r/q]
+```
+
+`y` continues, `r` discards and starts over, `q` leaves it untouched. Pass
+`--resume` or `--restart` to answer in advance; anything non-interactive resumes
+by default so scripts never block. `llcpp rm <name>` throws a partial away.
+
+A dropped connection mid-transfer is retried automatically with backoff — only a
+deliberate interrupt produces a partial you get asked about.
 
 Environment: `LLAMA_CACHE`, `HF_TOKEN`, `HF_HOME`, `LLCPP_BANDWIDTH`, `NO_COLOR`.
 

@@ -41,7 +41,7 @@ DEFAULT_CTX = 32768
 PORT_BASE = 8080
 FREE_SPACE_FLOOR = 10 * 1024**3   # refuse a pull that would leave less than this
 MAX_RETRIES = 8                   # consecutive attempts that move zero bytes
-__version__ = "0.2.1"
+__version__ = "0.3.0"
 UA = {"User-Agent": "llcpp/" + __version__}
 
 # Quant tokens as they appear in GGUF filenames: Q4_K_M, UD-Q6_K_XL, IQ2_XXS, BF16...
@@ -125,6 +125,7 @@ def load_reg() -> dict:
         reg = {}
     reg.setdefault("models", {})
     reg.setdefault("servers", {})
+    reg.setdefault("partials", {})
     return reg
 
 
@@ -1005,6 +1006,59 @@ def choose_quant(quants: dict, budget: int, prefer: str) -> "tuple[str, int] | N
 
 # ------------------------------------------------------------------- commands
 
+def ask(prompt: str, choices: str, default: str) -> str:
+    """One-key prompt. Non-interactive callers get the default without blocking."""
+    if not sys.stdin.isatty() or not sys.stderr.isatty():
+        return default
+    shown = "/".join(c.upper() if c == default else c for c in choices)
+    while True:
+        try:
+            got = input(f"{prompt} [{shown}] ").strip().lower()
+        except (EOFError, KeyboardInterrupt):
+            print()
+            return "q"
+        if not got:
+            return default
+        if got[0] in choices:
+            return got[0]
+
+
+def bytes_on_disk(repo: str, plan: "list[dict]") -> int:
+    root = models_dir() / repo
+    return sum((root / f["path"]).stat().st_size
+               for f in plan if (root / f["path"]).exists())
+
+
+def save_partial(name: str, repo: str, quant: str, plan: "list[dict]",
+                 total: int) -> None:
+    """Remember an unfinished pull so `list` can show it and `pull` can offer it."""
+    reg = load_reg()
+    reg.setdefault("partials", {})[name] = {
+        "repo": repo, "quant": quant, "total": total,
+        "done": bytes_on_disk(repo, plan),
+        "files": [{"path": f["path"], "size": f["size"]} for f in plan],
+        "updated": datetime.now(timezone.utc).isoformat(),
+    }
+    save_reg(reg)
+
+
+def clear_partial(name: str) -> None:
+    reg = load_reg()
+    if reg.setdefault("partials", {}).pop(name, None) is not None:
+        save_reg(reg)
+
+
+def discard_partial(repo: str, plan: "list[dict]") -> int:
+    root = models_dir() / repo
+    freed = 0
+    for f in plan:
+        p = root / f["path"]
+        if p.exists():
+            freed += p.stat().st_size
+            p.unlink()
+    return freed
+
+
 def cmd_pull(args: argparse.Namespace) -> None:
     reg = load_reg()
     repo, want = resolve_ref(args.model, reg, args.yes)
@@ -1037,14 +1091,47 @@ def cmd_pull(args: argparse.Namespace) -> None:
             tag = f"  {C.BLU}[vision]{C.OFF}"
         info(f"  {C.DIM}·{C.OFF} {f['path']}  {C.DIM}{human(f['size'])}{C.OFF}{tag}")
 
+    # An unfinished pull is resumable, but silently continuing a days-old partial
+    # is surprising — say what is there and let the caller choose.
+    if 0 < have < total:
+        pct = have / total * 100
+        prev = load_reg().get("partials", {}).get(name)
+        when = f", interrupted {ago(prev['updated'])}" if prev else ""
+        info(f"{C.YLW}partial download found{C.OFF}: "
+             f"{human(have)} of {human(total)} ({pct:.1f}%){when}")
+        choice = "r" if args.restart else ("y" if args.resume or args.yes else
+                                           ask("  resume?", "yrq", "y"))
+        if choice == "q":
+            info("cancelled — nothing changed")
+            return
+        if choice == "r":
+            freed = discard_partial(repo, plan)
+            clear_partial(name)
+            info(f"{C.DIM}discarded {human(freed)}, starting over{C.OFF}")
+            have, need = 0, total
+
     if free - need < FREE_SPACE_FLOOR:
         die(f"not enough disk: {human(need)} needed, {human(free)} free "
             f"(keeping a {human(FREE_SPACE_FLOOR)} floor)")
 
-    for f in plan:
-        url = HF_RESOLVE.format(repo=repo, path=urllib.parse.quote(f["path"]))
-        download(url, dest_dir / f["path"], f["size"], Path(f["path"]).name)
+    try:
+        for f in plan:
+            url = HF_RESOLVE.format(repo=repo, path=urllib.parse.quote(f["path"]))
+            download(url, dest_dir / f["path"], f["size"], Path(f["path"]).name)
+    except KeyboardInterrupt:
+        save_partial(name, repo, quant, plan, total)
+        got = bytes_on_disk(repo, plan)
+        if _tty():
+            sys.stderr.write("\r" + " " * 100 + "\r")
+        info(f"\n{C.YLW}interrupted{C.OFF} — kept {human(got)} of {human(total)} "
+             f"({got / total * 100:.1f}%)\n"
+             f"  resume with: {C.BOLD}llcpp pull {repo}:{quant}{C.OFF}")
+        sys.exit(130)
+    except SystemExit:
+        save_partial(name, repo, quant, plan, total)
+        raise
 
+    clear_partial(name)
     reg = load_reg()
     reg["models"][name] = {
         "repo": repo, "quant": quant, "dir": repo,
@@ -1088,7 +1175,14 @@ def cmd_serve(args: argparse.Namespace) -> None:
 def cmd_list(args: argparse.Namespace) -> None:
     reg = reap(load_reg())
     save_reg(reg)
-    if not reg["models"]:
+    partials = reg.get("partials", {})
+    stale = [n for n, d in partials.items()
+             if n in reg["models"] or bytes_on_disk(d["repo"], d["files"]) == 0]
+    for n in stale:
+        del partials[n]
+    if stale:
+        save_reg(reg)
+    if not reg["models"] and not partials:
         print("no models. Try: llcpp pull unsloth/Qwen3.8-27B-GGUF:Q6")
         return
     rows = []
@@ -1108,6 +1202,16 @@ def cmd_list(args: argparse.Namespace) -> None:
           + "  " + hdr[5] + C.OFF)
     for r in rows:
         print("  ".join(str(r[i]).ljust(widths[i]) for i in range(5)) + "  " + r[5])
+
+    if partials:
+        print(f"\n{C.YLW}unfinished{C.OFF}")
+        for name, d in sorted(partials.items()):
+            done = bytes_on_disk(d["repo"], d["files"])
+            pct = done / d["total"] * 100 if d["total"] else 0
+            print(f"  {name}  {C.DIM}{human(done)} of {human(d['total'])} "
+                  f"({pct:.1f}%), stopped {ago(d['updated'])}{C.OFF}")
+        first = sorted(partials.items())[0][1]
+        print(f"{C.DIM}  resume: llcpp pull {first['repo']}:{first['quant']}{C.OFF}")
 
 
 def cmd_ps(args: argparse.Namespace) -> None:
@@ -1154,6 +1258,15 @@ def cmd_stop(args: argparse.Namespace) -> None:
 def cmd_rm(args: argparse.Namespace) -> None:
     reg = reap(load_reg())
     for ref in args.model:
+        part = next((n for n in reg.get("partials", {})
+                     if n == ref or n.split(":")[0] == ref.split(":")[0]), None)
+        if part and part not in reg["models"]:
+            d = reg["partials"][part]
+            freed = discard_partial(d["repo"], d["files"])
+            clear_partial(part)
+            info(f"{C.GRN}removed{C.OFF} unfinished {part} "
+                 f"{C.DIM}({human(freed)} freed){C.OFF}")
+            continue
         name = _match_local(ref, reg, autopull=False)
         entry = reg["models"][name]
 
@@ -1193,6 +1306,7 @@ def cmd_rm(args: argparse.Namespace) -> None:
                 pass
 
         del reg["models"][name]
+        reg.setdefault("partials", {}).pop(name, None)
         save_reg(reg)
         info(f"{C.GRN}removed{C.OFF} {name} {C.DIM}({human(freed)} freed){C.OFF}")
 
@@ -1424,7 +1538,8 @@ def _match_local(ref: str, reg: dict, autopull: bool) -> str:
         die(f"model {ref!r} is not pulled. See: llcpp list")
 
     info(f"{C.DIM}{ref} not found locally — pulling{C.OFF}")
-    ns = argparse.Namespace(model=ref, no_mtp=False, no_vision=False, yes=True)
+    ns = argparse.Namespace(model=ref, no_mtp=False, no_vision=False, yes=True,
+                            resume=True, restart=False)
     cmd_pull(ns)
     reg2 = load_reg()
     matches = [n for n in reg2["models"] if n.split(":")[0] == base]
@@ -1587,8 +1702,20 @@ Environment
   LLCPP_BANDWIDTH    override the memory bandwidth used for estimates, in GB/s
   NO_COLOR           disable colour
 
-Downloads resume. If one is interrupted, run the same `pull` again and it
-picks up where it stopped rather than starting over.
+Interrupted downloads
+
+  Ctrl-C during a pull keeps what has transferred and records it. `list` shows
+  it under "unfinished", and pulling the same model again offers a choice:
+
+    partial download found: 1.3 GB of 34.6 GB (3.8%), interrupted 2 hours ago
+      resume? [Y/r/q]
+
+  y  continue from where it stopped     r  discard and start over
+  q  leave it alone and do nothing
+
+  Use --resume or --restart to answer in advance, which scripts and any
+  non-interactive run do automatically (resume is the default). `llcpp rm`
+  accepts an unfinished model name to throw the partial away.
 """,
 
 "editors": """\
@@ -1672,7 +1799,12 @@ and `llcpp help quants`.
     sp.add_argument("model", help="org/repo:quant, or a bare name to search for")
     sp.add_argument("--no-mtp", action="store_true", help="skip the MTP speculative-decode head")
     sp.add_argument("--no-vision", action="store_true", help="skip the mmproj vision encoder")
-    sp.add_argument("-y", "--yes", action="store_true", help="do not print search alternatives")
+    sp.add_argument("-y", "--yes", action="store_true",
+                    help="accept defaults without prompting")
+    sp.add_argument("--resume", action="store_true",
+                    help="continue an unfinished download without asking")
+    sp.add_argument("--restart", action="store_true",
+                    help="discard an unfinished download and start over")
     sp.set_defaults(func=cmd_pull)
 
     sr = _sp(sub, "run", "chat with a model (pulls and starts it if needed)", """
