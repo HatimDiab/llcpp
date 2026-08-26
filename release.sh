@@ -12,14 +12,17 @@
 set -euo pipefail
 
 VER="${1:?usage: ./release.sh <version>   e.g. ./release.sh 0.4.0}"
-USER=HatimDiab
-REPO="$USER/llcpp"
+# NOT `USER` — that is an environment variable Homebrew reads to resolve the
+# real OS user, and clobbering it makes `brew install` fail with
+# "user HatimDiab doesn't exist".
+OWNER=HatimDiab
+REPO="$OWNER/llcpp"
 SRC="$(cd "$(dirname "$0")" && pwd)"
 TAP="$(brew --repository)/Library/Taps/hatimdiab/homebrew-tap"
 FORMULA="$TAP/Formula/llcpp.rb"
 
 [[ "$VER" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || { echo "version must be X.Y.Z" >&2; exit 1; }
-[[ -d "$TAP" ]] || { echo "tap not found at $TAP — run: brew tap $USER/tap" >&2; exit 1; }
+[[ -d "$TAP" ]] || { echo "tap not found at $TAP — run: brew tap $OWNER/tap" >&2; exit 1; }
 command -v gh >/dev/null || { echo "gh not installed" >&2; exit 1; }
 
 cd "$SRC"
@@ -75,12 +78,12 @@ git add -A
 git commit -m "llcpp $VER"
 
 # 4. Prove it builds and passes its own test block before asking anyone to merge.
-brew audit --strict --online "$USER/tap/llcpp"
-brew reinstall --build-from-source "$USER/tap/llcpp"
-brew test "$USER/tap/llcpp"
+brew audit --strict --online "$OWNER/tap/llcpp"
+brew reinstall --build-from-source "$OWNER/tap/llcpp"
+brew test "$OWNER/tap/llcpp"
 
 git push -u origin "llcpp-$VER"
-gh pr create --repo "$USER/homebrew-tap" --base main --head "llcpp-$VER" \
+gh pr create --repo "$OWNER/homebrew-tap" --base main --head "llcpp-$VER" \
   --title "llcpp $VER" \
   --body "Points the formula at v$VER.
 
