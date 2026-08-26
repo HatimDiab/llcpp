@@ -14,6 +14,18 @@ split GGUF shards. No wrapper process sits between you and llama-server.
 """
 from __future__ import annotations
 
+import sys
+
+# The Homebrew formula ships this with a `/usr/bin/env python3` shebang, so the
+# interpreter is whatever is first on PATH — which may be older than we need.
+if sys.version_info < (3, 9):
+    sys.stderr.write(
+        "llcpp needs Python 3.9 or newer; this is %d.%d (%s).\n"
+        "Point it at a newer interpreter, e.g.:  python3.13 %s\n"
+        % (sys.version_info[0], sys.version_info[1], sys.executable, sys.argv[0])
+    )
+    raise SystemExit(1)
+
 import argparse
 import errno
 import http.client
@@ -26,7 +38,6 @@ import signal
 import socket
 import ssl
 import subprocess
-import sys
 import time
 import urllib.error
 import urllib.parse

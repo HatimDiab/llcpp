@@ -154,6 +154,17 @@ Cursor's own base-URL override proxies through Cursor's servers and cannot reach
 `127.0.0.1`, and loading a vision encoder makes llama-server disable prompt-cache
 reuse — which for coding is usually the worse trade.
 
+That second one has a one-flag fix. If the model shipped an `mmproj` you do not
+need, skip it and keep cache reuse:
+
+```bash
+llcpp serve qwen3.8-27b --port 8080 --no-vision
+```
+
+`serve` and `run` both take `--no-vision`; `pull --no-vision` skips downloading
+the encoder in the first place. When a pulled model has an `mmproj` that is being
+left out, startup says so (`no vision, cache-reuse on`).
+
 ## Storage
 
 ```
