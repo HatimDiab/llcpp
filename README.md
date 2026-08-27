@@ -184,6 +184,21 @@ llama.cpp caps the slot at the model's training context, and llcpp defaults to
 `--no-context-shift` — good for coding, wrong for long-form generation that runs
 past the window. `--context-shift` slides it instead of stopping.
 
+To find out what a pulled model actually serves, rather than what it was asked
+for:
+
+```bash
+python3 tests/long_context.py <model> --tokens 8192
+```
+
+It sizes a needle-in-a-haystack prompt with the server's own tokenizer, sends it,
+and checks the answer came back. A capped model fails with the real reason:
+
+```
+FAIL: server rejected the prompt (400): request (4325 tokens) exceeds the
+available context size (2048 tokens)
+```
+
 ## Storage
 
 ```
