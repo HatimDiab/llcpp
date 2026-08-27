@@ -511,7 +511,13 @@ def reap(reg: dict) -> dict:
     return reg
 
 
-def build_cmd(entry: dict, port: int, ctx: int, name: str, vision: bool = True) -> "list[str]":
+def _is_jinja(tpl: str) -> bool:
+    """A template body, as opposed to one of llama.cpp's built-in template names."""
+    return "{{" in tpl or "{%" in tpl
+
+
+def build_cmd(entry: dict, port: int, ctx: int, name: str, vision: bool = True,
+              chat_template: "str | None" = None, context_shift: bool = False) -> "list[str]":
     root = models_dir() / entry["dir"]
     cmd = ["llama-server", "-m", str(root / entry["main"])]
     if entry.get("mtp"):
@@ -524,15 +530,29 @@ def build_cmd(entry: dict, port: int, ctx: int, name: str, vision: bool = True) 
         cmd += ["--mmproj", str(root / entry["mmproj"])]
     cmd += ["-a", name.split(":")[0],
             "-c", str(ctx), "-ngl", "99", "-fa", "on",
-            "--cache-reuse", "256", "--jinja",
-            "--reasoning-format", "deepseek",
-            "--no-context-shift",
-            "--host", "127.0.0.1", "--port", str(port)]
+            "--cache-reuse", "256"]
+    # llama-server reads --chat-template two different ways: with --jinja set it
+    # takes the argument as a literal template, without it as a built-in name.
+    # Passing a name while --jinja is on renders that name as the whole prompt,
+    # so pick the mode from the value rather than always sending --jinja.
+    if chat_template and not _is_jinja(chat_template):
+        cmd += ["--chat-template", chat_template]
+    else:
+        cmd += ["--jinja"]
+        if chat_template:
+            cmd += ["--chat-template", chat_template]
+    cmd += ["--reasoning-format", "deepseek"]
+    # Sliding the window costs a reprocess, which is the wrong trade for coding.
+    # Short-context models run out mid-answer without it, so it stays opt-in.
+    if not context_shift:
+        cmd += ["--no-context-shift"]
+    cmd += ["--host", "127.0.0.1", "--port", str(port)]
     return cmd
 
 
 def ensure_server(name: str, reg: dict, ctx: int, port: "int | None" = None,
-                  vision: bool = True) -> "tuple[int, dict]":
+                  vision: bool = True, chat_template: "str | None" = None,
+                  context_shift: bool = False) -> "tuple[int, dict]":
     reap(reg)
     entry = reg["models"].get(name)
     if not entry:
@@ -543,6 +563,16 @@ def ensure_server(name: str, reg: dict, ctx: int, port: "int | None" = None,
         if port and running["port"] != port:
             die(f"{name} is already serving on port {running['port']}; "
                 f"stop it first (llcpp stop {name}) to move it to {port}")
+        # These are baked into the process at launch, so a running server cannot
+        # adopt them. Say so rather than silently ignoring the flag.
+        differs = [flag for flag, want, have in (
+            ("--chat-template", chat_template, running.get("chat_template")),
+            ("--context-shift", bool(context_shift), bool(running.get("context_shift"))),
+        ) if want != have]
+        if differs:
+            die(f"{name} is already serving on port {running['port']} with different "
+                f"{' and '.join(differs)} settings; restart it to change them: "
+                f"llcpp stop {name}")
         return running["port"], reg
 
     port = port or free_port(reg)
@@ -552,7 +582,7 @@ def ensure_server(name: str, reg: dict, ctx: int, port: "int | None" = None,
     logs = cache_root() / "logs"
     logs.mkdir(parents=True, exist_ok=True)
     logf = logs / f"{name.replace('/', '_').replace(':', '_')}.log"
-    cmd = build_cmd(entry, port, ctx, name, vision)
+    cmd = build_cmd(entry, port, ctx, name, vision, chat_template, context_shift)
 
     extras = []
     if entry.get("mtp"):
@@ -561,6 +591,11 @@ def ensure_server(name: str, reg: dict, ctx: int, port: "int | None" = None,
         extras.append("vision")
     elif entry.get("mmproj"):
         extras.append("no vision, cache-reuse on")
+    if chat_template:
+        extras.append(f"template {chat_template}"
+                      if len(chat_template) < 24 else "custom template")
+    if context_shift:
+        extras.append("context shift")
     suffix = f" {C.DIM}({', '.join(extras)}){C.OFF}" if extras else ""
     info(f"{C.DIM}starting {name} on :{port}{C.OFF}{suffix}")
 
@@ -583,7 +618,9 @@ def ensure_server(name: str, reg: dict, ctx: int, port: "int | None" = None,
 
     reg["servers"][name] = {"port": port, "pid": proc.pid,
                             "started": datetime.now(timezone.utc).isoformat(),
-                            "ctx": ctx, "log": str(logf)}
+                            "ctx": ctx, "log": str(logf),
+                            "chat_template": chat_template,
+                            "context_shift": bool(context_shift)}
     save_reg(reg)
     return port, reg
 
@@ -1161,7 +1198,9 @@ def cmd_run(args: argparse.Namespace) -> None:
     reg = load_reg()
     name = _match_local(args.model, reg, autopull=True)
     reg = load_reg()
-    port, reg = ensure_server(name, reg, args.ctx, vision=not args.no_vision)
+    port, reg = ensure_server(name, reg, args.ctx, vision=not args.no_vision,
+                              chat_template=args.chat_template,
+                              context_shift=args.context_shift)
 
     prompt = " ".join(args.prompt).strip() if args.prompt else ""
     if not prompt and not sys.stdin.isatty():
@@ -1176,7 +1215,9 @@ def cmd_serve(args: argparse.Namespace) -> None:
     reg = load_reg()
     name = _match_local(args.model, reg, autopull=True)
     reg = load_reg()
-    port, _ = ensure_server(name, reg, args.ctx, args.port, vision=not args.no_vision)
+    port, _ = ensure_server(name, reg, args.ctx, args.port, vision=not args.no_vision,
+                            chat_template=args.chat_template,
+                            context_shift=args.context_shift)
     print(f"{C.GRN}{name}{C.OFF} serving on {C.BOLD}http://127.0.0.1:{port}{C.OFF}")
     print(f"  OpenAI endpoint  http://127.0.0.1:{port}/v1")
     print(f"  web UI           http://127.0.0.1:{port}")
@@ -1837,6 +1878,12 @@ In the REPL: /bye to exit, /clear to forget the conversation, /think on|off,
     sr.add_argument("--no-think", action="store_true", help="disable reasoning")
     sr.add_argument("--no-vision", action="store_true",
                     help="skip mmproj; keeps llama.cpp prompt-cache reuse enabled")
+    sr.add_argument("--chat-template", metavar="NAME|JINJA",
+                    help="override the model's chat template (e.g. alpaca, vicuna, "
+                         "chatml) for GGUFs that ship without one")
+    sr.add_argument("--context-shift", action="store_true",
+                    help="slide the window instead of stopping when the context "
+                         "fills; useful on short-context models")
     sr.set_defaults(func=cmd_run)
 
     ss = _sp(sub, "serve", "start a model\'s server and leave it running", """
@@ -1854,6 +1901,12 @@ For wiring this into VS Code or Cursor, see `llcpp help editors`.
     ss.add_argument("--ctx", type=int, default=DEFAULT_CTX)
     ss.add_argument("--no-vision", action="store_true",
                     help="skip mmproj; keeps llama.cpp prompt-cache reuse enabled")
+    ss.add_argument("--chat-template", metavar="NAME|JINJA",
+                    help="override the model's chat template (e.g. alpaca, vicuna, "
+                         "chatml) for GGUFs that ship without one")
+    ss.add_argument("--context-shift", action="store_true",
+                    help="slide the window instead of stopping when the context "
+                         "fills; useful on short-context models")
     ss.set_defaults(func=cmd_serve)
 
     sq = _sp(sub, "search", "find models that fit this machine", """
