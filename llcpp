@@ -1107,7 +1107,7 @@ def discard_partial(repo: str, plan: "list[dict]") -> int:
     return freed
 
 
-def cmd_pull(args: argparse.Namespace) -> None:
+def cmd_pull(args: argparse.Namespace) -> str:
     reg = load_reg()
     repo, want = resolve_ref(args.model, reg, args.yes)
     info(f"{C.DIM}resolving {repo}:{want}{C.OFF}")
@@ -1192,6 +1192,7 @@ def cmd_pull(args: argparse.Namespace) -> None:
     }
     save_reg(reg)
     info(f"{C.GRN}pulled{C.OFF} {C.BOLD}{name}{C.OFF} → llcpp run {name.split(':')[0]}")
+    return name
 
 
 def cmd_run(args: argparse.Namespace) -> None:
@@ -1592,11 +1593,16 @@ def _match_local(ref: str, reg: dict, autopull: bool) -> str:
     info(f"{C.DIM}{ref} not found locally — pulling{C.OFF}")
     ns = argparse.Namespace(model=ref, no_mtp=False, no_vision=False, yes=True,
                             resume=True, restart=False)
-    cmd_pull(ns)
+    # cmd_pull registers under the short name, so searching the registry for the
+    # ref the user typed (usually an org/repo path) would never find it.
+    pulled = cmd_pull(ns)
     reg2 = load_reg()
-    matches = [n for n in reg2["models"] if n.split(":")[0] == base]
+    if pulled in reg2["models"]:
+        return pulled
+    matches = [n for n in reg2["models"] if n.split(":")[0] == pulled.split(":")[0]]
     if not matches:
-        die(f"pull succeeded but {ref!r} still not registered")
+        die(f"pull succeeded but {pulled!r} is not in the registry; "
+            f"see llcpp list")
     return matches[0]
 
 
