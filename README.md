@@ -165,6 +165,25 @@ llcpp serve qwen3.8-27b --port 8080 --no-vision
 the encoder in the first place. When a pulled model has an `mmproj` that is being
 left out, startup says so (`no vision, cache-reuse on`).
 
+## Older GGUFs
+
+Models that ship without a chat template fall back to ChatML, which is wrong for
+anything trained on Alpaca- or Vicuna-style prompts — the stop token never fires
+and `<|im_end|>` leaks into replies. Override it:
+
+```bash
+llcpp run some-old-30b --chat-template vicuna          # a built-in name
+llcpp run some-old-30b --chat-template "$(cat tpl.j2)" # or a jinja template
+```
+
+A bare name is passed to llama.cpp as a built-in; anything containing jinja
+syntax is passed as a literal template.
+
+Short-context models are the other half of this. llcpp caps nothing itself, but
+llama.cpp caps the slot at the model's training context, and llcpp defaults to
+`--no-context-shift` — good for coding, wrong for long-form generation that runs
+past the window. `--context-shift` slides it instead of stopping.
+
 ## Storage
 
 ```
