@@ -52,7 +52,7 @@ DEFAULT_CTX = 32768
 PORT_BASE = 8080
 FREE_SPACE_FLOOR = 10 * 1024**3   # refuse a pull that would leave less than this
 MAX_RETRIES = 8                   # consecutive attempts that move zero bytes
-__version__ = "0.5.0"
+__version__ = "0.6.0"
 UA = {"User-Agent": "llcpp/" + __version__}
 
 # Quant tokens as they appear in GGUF filenames: Q4_K_M, UD-Q6_K_XL, IQ2_XXS, BF16...
