@@ -165,6 +165,27 @@ llcpp serve qwen3.8-27b --port 8080 --no-vision
 the encoder in the first place. When a pulled model has an `mmproj` that is being
 left out, startup says so (`no vision, cache-reuse on`).
 
+## Instructions and transcripts
+
+Keep a style guide, character brief or system prompt in a text file and send it
+as the system message:
+
+```bash
+llcpp run qwen3.8-27b "Describe a harbour at dusk." --system style.txt -o harbour.md
+```
+
+`--out` writes the reply to a file. In the REPL it writes the whole conversation
+there on exit, and these work mid-session:
+
+```
+/system FILE    load instructions from a file (bare /system shows them)
+/save [FILE]    write the conversation, instructions included
+/save last [F]  write just the last reply
+```
+
+`/save` with no filename picks a timestamped one. `/clear` forgets the
+conversation but keeps loaded instructions.
+
 ## Older GGUFs
 
 Models that ship without a chat template fall back to ChatML, which is wrong for

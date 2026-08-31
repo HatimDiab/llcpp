@@ -677,29 +677,147 @@ def stream_chat(port: int, messages: list, think: bool, max_tokens: int = 4096) 
             "reasoning": "".join(reasoning)}
 
 
-def repl(name: str, port: int) -> None:
+def _init_history() -> "object | None":
+    """Give input() arrow keys, line editing and a history file.
+
+    Until readline is imported, input() is a dumb reader: arrow keys arrive as
+    raw escape sequences instead of recalling the previous line. Importing it is
+    the whole fix; the history file just makes it survive restarts.
+    """
+    try:
+        import readline
+    except ImportError:                      # not built on this interpreter
+        return None
+    try:
+        readline.read_history_file(_history_path())
+    except (OSError, ValueError):            # absent or written by another lib
+        pass
+    readline.set_history_length(2000)
+    return readline
+
+
+def _history_path() -> Path:
+    return cache_root() / "repl_history"
+
+
+def _save_history(readline: "object | None") -> None:
+    if readline is None:
+        return
+    try:
+        _history_path().parent.mkdir(parents=True, exist_ok=True)
+        readline.write_history_file(_history_path())
+    except OSError:                          # read-only cache is not fatal
+        pass
+
+
+def _read_text(path: str) -> str:
+    """Read an instructions file, dying with the reason rather than a traceback."""
+    try:
+        return Path(path).expanduser().read_text(encoding="utf-8").strip()
+    except OSError as e:
+        die(f"cannot read {path}: {e.strerror}")
+
+
+def _write_text(path: str, text: str) -> Path:
+    dest = Path(path).expanduser()
+    try:
+        if dest.parent != Path(""):
+            dest.parent.mkdir(parents=True, exist_ok=True)
+        dest.write_text(text, encoding="utf-8")
+    except OSError as e:
+        die(f"cannot write {path}: {e.strerror}")
+    return dest
+
+
+def _default_save_name(name: str) -> str:
+    stamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+    return f"{name.split(':')[0]}-{stamp}.md"
+
+
+def _transcript(messages: list) -> str:
+    """The conversation as plain markdown - instructions first, then each turn."""
+    out = []
+    for m in messages:
+        body = (m.get("content") or "").strip()
+        if not body:
+            continue
+        if m["role"] == "system":
+            out.append(f"# instructions\n\n{body}")
+        elif m["role"] == "user":
+            out.append(f"## prompt\n\n{body}")
+        else:
+            out.append(f"## reply\n\n{body}")
+    return "\n\n".join(out) + "\n"
+
+
+def _last_reply(messages: list) -> str:
+    for m in reversed(messages):
+        if m["role"] == "assistant":
+            return (m.get("content") or "").strip() + "\n"
+    return ""
+
+
+def repl(name: str, port: int, messages: "list | None" = None,
+         out: "str | None" = None) -> None:
     think = True
-    messages: list = []
+    messages = list(messages or [])
+    readline = _init_history()
     print(f"{C.DIM}{name} on :{port} — /bye to exit, /? for commands{C.OFF}")
     while True:
         try:
             line = input(f"{C.BOLD}>>>{C.OFF} ").strip()
         except (EOFError, KeyboardInterrupt):
             print()
+            _save_history(readline)
+            if out:
+                dest = _write_text(out, _transcript(messages))
+                info(f"{C.DIM}saved {dest}{C.OFF}")
             return
         if not line:
             continue
         if line in ("/bye", "/exit", "/quit"):
+            _save_history(readline)
+            if out:
+                dest = _write_text(out, _transcript(messages))
+                info(f"{C.DIM}saved {dest}{C.OFF}")
             return
         if line == "/?":
             print("  /bye            exit\n"
                   "  /clear          forget the conversation\n"
                   "  /think on|off   toggle reasoning\n"
-                  "  /web            open the llama.cpp web UI")
+                  "  /web            open the llama.cpp web UI\n"
+                  "  /save [FILE]    write the conversation to a file\n"
+                  "  /save last [F]  write just the last reply\n"
+                  "  /system FILE    load instructions from a file\n"
+                  "  up/down         previous prompts, kept across sessions")
+            continue
+        if line.startswith("/save"):
+            rest = line[len("/save"):].split()
+            only_last = bool(rest) and rest[0] == "last"
+            if only_last:
+                rest = rest[1:]
+            body = _last_reply(messages) if only_last else _transcript(messages)
+            if not body.strip():
+                print(f"{C.DIM}nothing to save yet{C.OFF}")
+                continue
+            dest = _write_text(" ".join(rest) or _default_save_name(name), body)
+            print(f"{C.DIM}saved {dest} ({len(body)} bytes){C.OFF}")
+            continue
+        if line.startswith("/system"):
+            arg = line[len("/system"):].strip()
+            if not arg:
+                current = next((m for m in messages if m["role"] == "system"), None)
+                print(f"{C.DIM}{'no instructions loaded' if not current else current['content'][:400]}{C.OFF}")
+                continue
+            text = _read_text(arg)
+            messages = [m for m in messages if m["role"] != "system"]
+            messages.insert(0, {"role": "system", "content": text})
+            print(f"{C.DIM}instructions loaded from {arg} ({len(text)} chars){C.OFF}")
             continue
         if line == "/clear":
-            messages = []
-            print(f"{C.DIM}context cleared{C.OFF}")
+            messages = [m for m in messages if m["role"] == "system"]
+            kept = " (instructions kept)" if messages else ""
+            print(f"{C.DIM}context cleared{kept}{C.OFF}")
             continue
         if line.startswith("/think"):
             arg = line.split()[-1]
@@ -1203,13 +1321,22 @@ def cmd_run(args: argparse.Namespace) -> None:
                               chat_template=args.chat_template,
                               context_shift=args.context_shift)
 
+    messages: list = []
+    if args.system:
+        messages.append({"role": "system", "content": _read_text(args.system)})
+
     prompt = " ".join(args.prompt).strip() if args.prompt else ""
     if not prompt and not sys.stdin.isatty():
         prompt = sys.stdin.read().strip()
     if prompt:
-        stream_chat(port, [{"role": "user", "content": prompt}], not args.no_think)
+        messages.append({"role": "user", "content": prompt})
+        reply = stream_chat(port, messages, not args.no_think)
+        if args.out:
+            messages.append({"role": "assistant", "content": reply["content"]})
+            dest = _write_text(args.out, _last_reply(messages))
+            info(f"{C.DIM}saved {dest}{C.OFF}")
         return
-    repl(name, port)
+    repl(name, port, messages, args.out)
 
 
 def cmd_serve(args: argparse.Namespace) -> None:
@@ -1890,6 +2017,12 @@ In the REPL: /bye to exit, /clear to forget the conversation, /think on|off,
     sr.add_argument("--context-shift", action="store_true",
                     help="slide the window instead of stopping when the context "
                          "fills; useful on short-context models")
+    sr.add_argument("--system", metavar="FILE",
+                    help="load instructions from a text file (a style guide, "
+                         "a character brief) and send them as the system prompt")
+    sr.add_argument("-o", "--out", metavar="FILE",
+                    help="write the reply to a file; in the REPL, write the whole "
+                         "conversation there on exit")
     sr.set_defaults(func=cmd_run)
 
     ss = _sp(sub, "serve", "start a model\'s server and leave it running", """
