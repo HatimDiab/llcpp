@@ -677,25 +677,62 @@ def stream_chat(port: int, messages: list, think: bool, max_tokens: int = 4096) 
             "reasoning": "".join(reasoning)}
 
 
+def _init_history() -> "object | None":
+    """Give input() arrow keys, line editing and a history file.
+
+    Until readline is imported, input() is a dumb reader: arrow keys arrive as
+    raw escape sequences instead of recalling the previous line. Importing it is
+    the whole fix; the history file just makes it survive restarts.
+    """
+    try:
+        import readline
+    except ImportError:                      # not built on this interpreter
+        return None
+    try:
+        readline.read_history_file(_history_path())
+    except (OSError, ValueError):            # absent or written by another lib
+        pass
+    readline.set_history_length(2000)
+    return readline
+
+
+def _history_path() -> Path:
+    return cache_root() / "repl_history"
+
+
+def _save_history(readline: "object | None") -> None:
+    if readline is None:
+        return
+    try:
+        _history_path().parent.mkdir(parents=True, exist_ok=True)
+        readline.write_history_file(_history_path())
+    except OSError:                          # read-only cache is not fatal
+        pass
+
+
 def repl(name: str, port: int) -> None:
     think = True
     messages: list = []
+    readline = _init_history()
     print(f"{C.DIM}{name} on :{port} — /bye to exit, /? for commands{C.OFF}")
     while True:
         try:
             line = input(f"{C.BOLD}>>>{C.OFF} ").strip()
         except (EOFError, KeyboardInterrupt):
             print()
+            _save_history(readline)
             return
         if not line:
             continue
         if line in ("/bye", "/exit", "/quit"):
+            _save_history(readline)
             return
         if line == "/?":
             print("  /bye            exit\n"
                   "  /clear          forget the conversation\n"
                   "  /think on|off   toggle reasoning\n"
-                  "  /web            open the llama.cpp web UI")
+                  "  /web            open the llama.cpp web UI\n"
+                  "  up/down         previous prompts, kept across sessions")
             continue
         if line == "/clear":
             messages = []
